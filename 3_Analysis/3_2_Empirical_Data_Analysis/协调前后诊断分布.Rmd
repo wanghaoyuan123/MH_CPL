@@ -1,0 +1,617 @@
+```{r}
+# 本脚本用于比较“临床诊断抑郁 vs 非抑郁”两组
+# 在四个抑郁量表（DSRSC、PHQ-9、CDI、DASS）上的得分分布
+# 分别比较了数据协调前以及协调后的
+# 数据来源：
+# Questionnaire_With_Diagnosis_Label.xlsx
+# （已完成：ID 去重 + 病历诊断标签匹配）
+#
+# 分析流程与检出率分析保持一致：
+# - 数值转换
+# - 原始数据 -1
+# - 反向计分
+# - 年龄限制（7–18 岁）
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(mirt)
+library(papaja)
+library(patchwork)
+library(openxlsx)
+library(here)
+
+# ------------------------------------------------------------
+# 1) 读取数据
+# ------------------------------------------------------------
+diag_raw <- read.xlsx(
+  here("DATA", "Questionnaire_With_Diagnosis_Label.xlsx")
+)
+
+# ------------------------------------------------------------
+# 2) 基础处理与描述统计
+# ------------------------------------------------------------
+diag_raw <- diag_raw %>%
+  mutate(
+    Gender = factor(Gender, levels = c("男", "女"), labels = c(1, 2))
+  ) %>%
+  mutate(
+    across(matches("Gender|Age|DSRSC|PHQ|DASS|CDI"), as.numeric)
+  ) %>%
+  filter(Age >= 7 & Age <= 18)
+
+cat("用于分析的样本量：", nrow(diag_raw), "\n")
+
+cat("\nDepression_status 分布：\n")
+print(table(diag_raw$Depression_status))
+
+cat("\n性别人数统计：\n")
+print(table(diag_raw$Gender))
+
+diag_gender_summary <- diag_raw %>%
+  summarise(
+    Male = sum(Gender == 1, na.rm = TRUE),
+    Female = sum(Gender == 2, na.rm = TRUE),
+    Total = n(),
+    Male_percent = round(Male / Total * 100, 2),
+    Female_percent = round(Female / Total * 100, 2)
+  )
+
+cat("\n性别比例：\n")
+print(diag_gender_summary)
+
+diag_age_summary <- diag_raw %>%
+  summarise(
+    Age_mean = round(mean(Age, na.rm = TRUE), 2),
+    Age_sd   = round(sd(Age, na.rm = TRUE), 2),
+    Age_min  = round(min(Age, na.rm = TRUE), 2),
+    Age_max  = round(max(Age, na.rm = TRUE), 2)
+  )
+
+cat("\n年龄统计：\n")
+print(diag_age_summary)
+
+dir.create(here("FIGURE"), showWarnings = FALSE, recursive = TRUE)
+dir.create(here("OUTPUT"), showWarnings = FALSE, recursive = TRUE)
+
+openxlsx::write.xlsx(
+  list(
+    gender_summary = diag_gender_summary,
+    age_summary = diag_age_summary
+  ),
+  here("OUTPUT", "Diagnosis_Distribution_Descriptive_Stats.xlsx"),
+  overwrite = TRUE
+)
+
+cat("✔ 已导出：OUTPUT/Diagnosis_Distribution_Descriptive_Stats.xlsx\n")
+
+# ------------------------------------------------------------
+# 3) 预处理（与检出率分析保持一致）
+# ------------------------------------------------------------
+diag_raw <- diag_raw %>%
+  mutate(
+    across(matches("DSRSC|PHQ|DASS|CDI"), ~ .x - 1)
+  )
+
+CDI_reverse_items <- c(
+  "CDI2", "CDI5", "CDI7", "CDI8", "CDI10",
+  "CDI11", "CDI13", "CDI15", "CDI16",
+  "CDI18", "CDI21", "CDI24", "CDI25"
+)
+
+DSRSC_reverse_items <- c(
+  "DSRSC3", "DSRSC5", "DSRSC6", "DSRSC10",
+  "DSRSC14", "DSRSC15", "DSRSC17", "DSRSC18"
+)
+
+diag_raw <- diag_raw %>%
+  mutate(across(all_of(CDI_reverse_items), ~ 2 - .)) %>%
+  mutate(across(all_of(DSRSC_reverse_items), ~ 2 - .))
+
+# ------------------------------------------------------------
+# 4) 建立用于 raw + harmonization 的统一分析样本
+#    —— 去掉量表题目缺失，保证 raw / theta 使用同一批样本
+# ------------------------------------------------------------
+diag_item_vars <- c(
+  paste0("DSRSC", 1:18),
+  paste0("PHQ", 1:9),
+  c("DASS3", "DASS5", "DASS10", "DASS13", "DASS16", "DASS17", "DASS21"),
+  paste0("CDI", 1:27)
+)
+
+diag_analysis <- diag_raw %>%
+  select(ID, Gender, Age, Depression_status, all_of(diag_item_vars)) %>%
+  drop_na()
+
+cat("\n用于 raw + harmonization 的完整作答样本量：", nrow(diag_analysis), "\n")
+
+# ------------------------------------------------------------
+# 5) 协调前：原始总分
+#    —— CDI26 不计入总分
+# ------------------------------------------------------------
+diag_analysis <- diag_analysis %>%
+  mutate(
+    raw_DSRSC = rowSums(select(., starts_with("DSRSC")), na.rm = TRUE),
+    raw_PHQ   = rowSums(select(., starts_with("PHQ")), na.rm = TRUE),
+    raw_CDI   = rowSums(select(., starts_with("CDI")), na.rm = TRUE) - CDI26,
+    raw_DASS  = rowSums(select(., starts_with("DASS")), na.rm = TRUE)
+  )
+
+diag_raw_long <- diag_analysis %>%
+  select(
+    ID,
+    Depression_status,
+    raw_DSRSC,
+    raw_PHQ,
+    raw_CDI,
+    raw_DASS
+  ) %>%
+  pivot_longer(
+    cols = starts_with("raw_"),
+    names_to = "Measure",
+    values_to = "Score"
+  ) %>%
+  mutate(
+    Measure = recode(
+      Measure,
+      raw_DSRSC = "DSRSC",
+      raw_PHQ   = "PHQ-9",
+      raw_CDI   = "CDI",
+      raw_DASS  = "DASS"
+    ),
+    Depression_status = factor(
+      Depression_status,
+      levels = c("Non-depression", "Depression")
+    )
+  )
+
+# ------------------------------------------------------------
+# 5.1) 原始 cutoff
+# ------------------------------------------------------------
+cutoff_raw_DSRSC <- 15
+cutoff_raw_PHQ   <- 10
+cutoff_raw_CDI   <- 20
+cutoff_raw_DASS_male   <- 4
+cutoff_raw_DASS_female <- 5
+
+# ------------------------------------------------------------
+# 6) 协调前分布图函数
+#    —— raw cutoff 线
+# ------------------------------------------------------------
+plot_diag_raw_distribution <- function(data, measure_name, show_legend = FALSE) {
+
+  dat <- data %>% filter(Measure == measure_name)
+  n <- nrow(dat)
+
+  p <- ggplot(
+    dat,
+    aes(x = Score, fill = Depression_status, color = Depression_status)
+  ) +
+    geom_histogram(
+      binwidth = 1,
+      position = position_dodge(width = 1),
+      alpha = 0.65,
+      linewidth = 0.2
+    ) +
+    geom_density(
+      aes(y = after_stat(density * n * 1)),
+      linewidth = 1,
+      alpha = 0.10,
+      adjust = 1
+    ) +
+    scale_fill_manual(
+      values = c(
+        "Non-depression" = "#2ca25f",
+        "Depression" = "#2b8cbe"
+      )
+    ) +
+    scale_color_manual(
+      values = c(
+        "Non-depression" = "#2ca25f",
+        "Depression" = "#2b8cbe"
+      )
+    ) +
+    labs(
+      title = measure_name,
+      x = "Depression sum score",
+      y = "Frequency"
+    ) +
+    papaja::theme_apa(base_size = 18) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      legend.title = element_blank(),
+      legend.position = if (show_legend) c(0.98, 0.98) else "none",
+      legend.justification = c(1, 1),
+      legend.direction = "vertical",
+      legend.background = element_rect(fill = "white", color = "black", linewidth = 0.3),
+      legend.key = element_rect(fill = "white", color = NA),
+      legend.text = element_text(size = 10),
+      legend.margin = margin(4, 6, 4, 6),
+      plot.margin = margin(5.5, 12, 5.5, 5.5)
+    )
+
+  if (measure_name == "DSRSC") {
+    p <- p + geom_vline(
+      xintercept = cutoff_raw_DSRSC,
+      linetype = "dashed",
+      linewidth = 0.9,
+      alpha = 0.8
+    )
+  }
+
+  if (measure_name == "PHQ-9") {
+    p <- p + geom_vline(
+      xintercept = cutoff_raw_PHQ,
+      linetype = "dashed",
+      linewidth = 0.9,
+      alpha = 0.8
+    )
+  }
+
+  if (measure_name == "CDI") {
+    p <- p + geom_vline(
+      xintercept = cutoff_raw_CDI,
+      linetype = "dashed",
+      linewidth = 0.9,
+      alpha = 0.8
+    )
+  }
+
+  if (measure_name == "DASS") {
+    p <- p +
+      geom_vline(
+        xintercept = cutoff_raw_DASS_male,
+        linetype = "dashed",
+        linewidth = 0.9,
+        alpha = 0.8
+      ) +
+      geom_vline(
+        xintercept = cutoff_raw_DASS_female,
+        linetype = "dotted",
+        linewidth = 0.9,
+        alpha = 0.8
+      )
+  }
+
+  return(p)
+}
+
+# ------------------------------------------------------------
+# 7) 协调前分布图
+# ------------------------------------------------------------
+p_diag_raw_DSRSC <- plot_diag_raw_distribution(diag_raw_long, "DSRSC", TRUE)
+p_diag_raw_PHQ   <- plot_diag_raw_distribution(diag_raw_long, "PHQ-9", FALSE)
+p_diag_raw_CDI   <- plot_diag_raw_distribution(diag_raw_long, "CDI", FALSE)
+p_diag_raw_DASS  <- plot_diag_raw_distribution(diag_raw_long, "DASS", FALSE)
+
+diag_raw_plot <- (
+  p_diag_raw_DSRSC |
+  p_diag_raw_PHQ   |
+  p_diag_raw_CDI   |
+  p_diag_raw_DASS
+) +
+  plot_annotation(
+    title = "Raw-score distributions by clinical diagnosis",
+    tag_levels = "A",
+    theme = theme(
+      plot.title = element_text(face = "bold", hjust = 0.5, size = 16),
+      plot.tag = element_text(size = 16, face = "bold")
+    )
+  )
+
+ggsave(
+  filename = here("FIGURE", "Diagnosis_Distribution_Raw.png"),
+  plot = diag_raw_plot,
+  width = 18,
+  height = 5.2,
+  dpi = 300
+)
+
+cat("✔ 已生成：FIGURE/Diagnosis_Distribution_Raw.png\n")
+
+# ------------------------------------------------------------
+# 8) 数据协调（Harmonization）
+#    —— CDI26 不进入 IRT
+# ------------------------------------------------------------
+diag_harm_items <- diag_analysis %>%
+  select(
+    starts_with("DSRSC"),
+    starts_with("PHQ"),
+    starts_with("DASS"),
+    starts_with("CDI")
+  ) %>%
+  select(-CDI26)
+
+diag_fit_all <- mirt(
+  diag_harm_items,
+  1,
+  itemtype = "graded",
+  SE = FALSE
+)
+
+# ------------------------------------------------------------
+# 8.1) build_walk_diag
+#      —— 改成 item + name 联合匹配
+# ------------------------------------------------------------
+build_walk_diag <- function(scale_dat, fit_all_model) {
+
+  tmp <- mirt(scale_dat, 1, itemtype = "graded")
+  sv2 <- mod2values(tmp)
+  uni <- mod2values(fit_all_model)
+
+  # 用 item + name + class 联合匹配
+  sv2$key <- paste(sv2$item, sv2$name, sv2$class, sep = " | ")
+  uni$key <- paste(uni$item, uni$name, uni$class, sep = " | ")
+
+  idx <- match(sv2$key, uni$key)
+
+  if (any(is.na(idx))) {
+    bad <- sv2[is.na(idx), c("item", "name", "class")]
+    message("以下参数在共同模型中找不到（前30个）：")
+    print(head(bad, 30))
+    stop("Crosswalk 参数匹配失败。")
+  }
+
+  if (length(unique(idx)) != length(idx)) {
+    stop("联合匹配后仍存在重复匹配，需进一步检查。")
+  }
+
+  sv2$value <- uni$value[idx]
+  sv2$est <- FALSE
+
+  walk <- mirt(scale_dat, 1, itemtype = "graded", pars = sv2)
+
+  list(
+    eap = fscores(walk, method = "EAP", full.scores.SE = FALSE),
+    eapsum = fscores(walk, method = "EAPsum", full.scores = FALSE, na.rm = TRUE)
+  )
+}
+
+# ------------------------------------------------------------
+# 9) 协调后 theta
+# ------------------------------------------------------------
+walk_diag_DSRSC <- build_walk_diag(
+  diag_analysis %>% select(starts_with("DSRSC")),
+  diag_fit_all
+)
+
+walk_diag_PHQ <- build_walk_diag(
+  diag_analysis %>% select(starts_with("PHQ")),
+  diag_fit_all
+)
+
+walk_diag_DASS <- build_walk_diag(
+  diag_analysis %>% select(starts_with("DASS")),
+  diag_fit_all
+)
+
+walk_diag_CDI <- build_walk_diag(
+  diag_analysis %>% select(starts_with("CDI")) %>% select(-CDI26),
+  diag_fit_all
+)
+
+diag_theta <- tibble(
+  ID = diag_analysis$ID,
+  Depression_status = diag_analysis$Depression_status,
+  theta_DSRSC = as.numeric(walk_diag_DSRSC$eap[, 1]),
+  theta_PHQ   = as.numeric(walk_diag_PHQ$eap[, 1]),
+  theta_DASS  = as.numeric(walk_diag_DASS$eap[, 1]),
+  theta_CDI   = as.numeric(walk_diag_CDI$eap[, 1])
+)
+
+diag_theta_long <- diag_theta %>%
+  pivot_longer(
+    cols = starts_with("theta_"),
+    names_to = "Measure",
+    values_to = "Theta"
+  ) %>%
+  mutate(
+    Measure = recode(
+      Measure,
+      theta_DSRSC = "DSRSC",
+      theta_PHQ   = "PHQ-9",
+      theta_CDI   = "CDI",
+      theta_DASS  = "DASS"
+    ),
+    Depression_status = factor(
+      Depression_status,
+      levels = c("Non-depression", "Depression")
+    )
+  )
+
+# ------------------------------------------------------------
+# 9.1) 原始总分 cutoff -> 协调后 theta cutoff
+# ------------------------------------------------------------
+diag_DSRSC_eapsum <- as.data.frame(walk_diag_DSRSC$eapsum)
+diag_PHQ_eapsum   <- as.data.frame(walk_diag_PHQ$eapsum)
+diag_DASS_eapsum  <- as.data.frame(walk_diag_DASS$eapsum)
+diag_CDI_eapsum   <- as.data.frame(walk_diag_CDI$eapsum)
+
+needed_cols <- c("Sum.Scores", "F1")
+stopifnot(all(needed_cols %in% names(diag_DSRSC_eapsum)))
+stopifnot(all(needed_cols %in% names(diag_PHQ_eapsum)))
+stopifnot(all(needed_cols %in% names(diag_DASS_eapsum)))
+stopifnot(all(needed_cols %in% names(diag_CDI_eapsum)))
+
+cutoff_theta_DSRSC <- diag_DSRSC_eapsum$F1[diag_DSRSC_eapsum$Sum.Scores == cutoff_raw_DSRSC]
+cutoff_theta_PHQ   <- diag_PHQ_eapsum$F1[diag_PHQ_eapsum$Sum.Scores == cutoff_raw_PHQ]
+cutoff_theta_CDI   <- diag_CDI_eapsum$F1[diag_CDI_eapsum$Sum.Scores == cutoff_raw_CDI]
+cutoff_theta_DASS_male   <- diag_DASS_eapsum$F1[diag_DASS_eapsum$Sum.Scores == cutoff_raw_DASS_male]
+cutoff_theta_DASS_female <- diag_DASS_eapsum$F1[diag_DASS_eapsum$Sum.Scores == cutoff_raw_DASS_female]
+
+stopifnot(
+  length(cutoff_theta_DSRSC) == 1,
+  length(cutoff_theta_PHQ) == 1,
+  length(cutoff_theta_CDI) == 1,
+  length(cutoff_theta_DASS_male) == 1,
+  length(cutoff_theta_DASS_female) == 1
+)
+
+cat("\n协调后的 theta cutoff：\n")
+cat("DSRSC:", round(cutoff_theta_DSRSC, 3), "\n")
+cat("PHQ-9:", round(cutoff_theta_PHQ, 3), "\n")
+cat("CDI:", round(cutoff_theta_CDI, 3), "\n")
+cat("DASS male:", round(cutoff_theta_DASS_male, 3), "\n")
+cat("DASS female:", round(cutoff_theta_DASS_female, 3), "\n")
+
+# ------------------------------------------------------------
+# 10) 协调后分布图函数
+#      —— theta cutoff 线
+# ------------------------------------------------------------
+plot_diag_theta_distribution <- function(data, measure_name, show_legend = FALSE) {
+
+  dat <- data %>% filter(Measure == measure_name)
+  n <- nrow(dat)
+
+  p <- ggplot(
+    dat,
+    aes(x = Theta, fill = Depression_status, color = Depression_status)
+  ) +
+    geom_histogram(
+      binwidth = 0.25,
+      position = position_dodge(width = 0.25),
+      alpha = 0.65,
+      linewidth = 0.2
+    ) +
+    geom_density(
+      aes(y = after_stat(density * n * 0.25)),
+      linewidth = 1,
+      alpha = 0.10,
+      adjust = 1
+    ) +
+    scale_fill_manual(
+      values = c(
+        "Non-depression" = "#2ca25f",
+        "Depression" = "#2b8cbe"
+      )
+    ) +
+    scale_color_manual(
+      values = c(
+        "Non-depression" = "#2ca25f",
+        "Depression" = "#2b8cbe"
+      )
+    ) +
+    labs(
+      title = measure_name,
+      x = "Depression latent score (θ)",
+      y = "Frequency"
+    ) +
+    papaja::theme_apa(base_size = 18) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      legend.title = element_blank(),
+      legend.position = if (show_legend) c(1.03, 0.98) else "none",
+      legend.justification = c(1, 1),
+      legend.direction = "vertical",
+      legend.background = element_rect(fill = "white", color = "black", linewidth = 0.3),
+      legend.key = element_rect(fill = "white", color = NA),
+      legend.text = element_text(size = 10),
+      legend.margin = margin(4, 6, 4, 6),
+      plot.margin = margin(5.5, 12, 5.5, 5.5)
+    )
+
+  if (measure_name == "DSRSC") {
+    p <- p + geom_vline(
+      xintercept = cutoff_theta_DSRSC,
+      linetype = "dashed",
+      linewidth = 0.9,
+      alpha = 0.8
+    )
+  }
+
+  if (measure_name == "PHQ-9") {
+    p <- p + geom_vline(
+      xintercept = cutoff_theta_PHQ,
+      linetype = "dashed",
+      linewidth = 0.9,
+      alpha = 0.8
+    )
+  }
+
+  if (measure_name == "CDI") {
+    p <- p + geom_vline(
+      xintercept = cutoff_theta_CDI,
+      linetype = "dashed",
+      linewidth = 0.9,
+      alpha = 0.8
+    )
+  }
+
+  if (measure_name == "DASS") {
+    p <- p +
+      geom_vline(
+        xintercept = cutoff_theta_DASS_male,
+        linetype = "dashed",
+        linewidth = 0.9,
+        alpha = 0.8
+      ) +
+      geom_vline(
+        xintercept = cutoff_theta_DASS_female,
+        linetype = "dotted",
+        linewidth = 0.9,
+        alpha = 0.8
+      )
+  }
+
+  return(p)
+}
+
+# ------------------------------------------------------------
+# 11) 协调后分布图
+# ------------------------------------------------------------
+p_diag_theta_DSRSC <- plot_diag_theta_distribution(diag_theta_long, "DSRSC", TRUE)
+p_diag_theta_PHQ   <- plot_diag_theta_distribution(diag_theta_long, "PHQ-9", FALSE)
+p_diag_theta_CDI   <- plot_diag_theta_distribution(diag_theta_long, "CDI", FALSE)
+p_diag_theta_DASS  <- plot_diag_theta_distribution(diag_theta_long, "DASS", FALSE)
+
+diag_theta_plot <- (
+  p_diag_theta_DSRSC |
+  p_diag_theta_PHQ   |
+  p_diag_theta_CDI   |
+  p_diag_theta_DASS
+) +
+  plot_annotation(
+    title = "Harmonized-score distributions by clinical diagnosis",
+    tag_levels = "A",
+    theme = theme(
+      plot.title = element_text(face = "bold", hjust = 0.5, size = 16),
+      plot.tag = element_text(size = 16, face = "bold")
+    )
+  )
+
+ggsave(
+  filename = here("FIGURE", "Diagnosis_Distribution_Harmonized.png"),
+  plot = diag_theta_plot,
+  width = 18,
+  height = 5.2,
+  dpi = 300
+)
+
+cat("✔ 已生成：FIGURE/Diagnosis_Distribution_Harmonized.png\n")
+
+# ------------------------------------------------------------
+# 12) 协调前后拼图
+# ------------------------------------------------------------
+diag_compare_plot <- diag_raw_plot / diag_theta_plot +
+  plot_annotation(
+    title = "Distributions of scale scores before and after harmonization",
+    tag_levels = "A",
+    theme = theme(
+      plot.title = element_text(face = "bold", hjust = 0.5, size = 18),
+      plot.tag = element_text(size = 16, face = "bold")
+    )
+  )
+
+ggsave(
+  filename = here("FIGURE", "Diagnosis_Distribution_Raw_vs_Harmonized.png"),
+  plot = diag_compare_plot,
+  width = 18,
+  height = 10.5,
+  dpi = 300
+)
+
+cat("✔ 已生成：FIGURE/Diagnosis_Distribution_Raw_vs_Harmonized.png\n")
+```
+
+
+

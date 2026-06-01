@@ -1,0 +1,567 @@
+
+
+---
+title: "实证数据分析：协调前后检出率比较"
+author: "why"
+date: "2024-09-05"
+output: html_document
+---
+
+```{R}
+# ============================================================
+# 0) Packages
+# ============================================================
+library(here)
+library(bruceR)
+library(tidyverse)
+library(openxlsx)
+library(mirt)
+library(ggplot2)
+library(treemapify)
+library(papaja)
+library(patchwork)
+
+```
+
+```{R}
+# ============================================================
+# 1) 数据读取与预处理（基本保持原逻辑）
+# ============================================================
+
+# 1.1 读取原始数据
+raw_data <- bruceR::import(here::here("data", "Raw_output.xlsx"))
+
+# 1.2 只保留分析所需变量
+selected_data <- raw_data %>%
+  select(
+    ID, Gender, Age,
+    DSRSC1:DSRSC18,
+    PHQ1:PHQ9,
+    DASS3, DASS5, DASS10, DASS13, DASS16, DASS17, DASS21,
+    CDI1:CDI27
+  )
+
+# 1.3 类型转换：Gender 男=1，女=2；其余转数值
+selected_data_numeric <- selected_data %>%
+  mutate(Gender = factor(Gender, levels = c("男", "女"), labels = c(1, 2))) %>%
+  mutate(across(matches("Gender|Age|DSRSC|PHQ|DASS|CDI"), as.numeric))
+
+# 1.4 缺失值处理
+clean_data <- selected_data_numeric %>%
+  drop_na()
+
+# 1.5 原始数据 -1，统一到量表正常起点
+transformed_data <- clean_data %>%
+  mutate(across(matches("DSRSC|PHQ|DASS|CDI"), ~ .x - 1))
+
+# 1.6 年龄筛选：7-18 岁
+filtered_data <- transformed_data %>%
+  filter(Age >= 7 & Age <= 18)
+
+# 1.7 反向计分
+CDI_reverse_items <- c(
+  "CDI2", "CDI5", "CDI7", "CDI8", "CDI10",
+  "CDI11", "CDI13", "CDI15", "CDI16",
+  "CDI18", "CDI21", "CDI24", "CDI25"
+)
+
+DSRSC_reverse_items <- c(
+  "DSRSC3", "DSRSC5", "DSRSC6", "DSRSC10",
+  "DSRSC14", "DSRSC15", "DSRSC17", "DSRSC18"
+)
+
+analysis_data <- filtered_data %>%
+  mutate(across(all_of(CDI_reverse_items), ~ 2 - .x)) %>%
+  mutate(across(all_of(DSRSC_reverse_items), ~ 2 - .x))
+
+# 1.8 题目列表
+dsrsc_items <- grep("^DSRSC", names(analysis_data), value = TRUE)
+phq_items   <- grep("^PHQ", names(analysis_data), value = TRUE)
+dass_items  <- grep("^DASS", names(analysis_data), value = TRUE)
+cdi_items_all <- grep("^CDI", names(analysis_data), value = TRUE)
+cdi_items_scored <- setdiff(cdi_items_all, "CDI26")   # CDI26 不计分
+
+# 1.9 输出目录
+dir.create(here::here("figure"), showWarnings = FALSE, recursive = TRUE)
+dir.create(here::here("output"), showWarnings = FALSE, recursive = TRUE)
+
+# 1.10 描述统计
+gender_proportion <- analysis_data %>%
+  summarise(
+    male = sum(Gender == 1, na.rm = TRUE),
+    female = sum(Gender == 2, na.rm = TRUE),
+    total = n(),
+    male_proportion = male / total * 100,
+    female_proportion = female / total * 100
+  )
+
+age_range <- analysis_data %>%
+  summarise(
+    min_age = min(Age, na.rm = TRUE),
+    max_age = max(Age, na.rm = TRUE)
+  )
+
+cat("==== 性别比例 ====\n")
+print(gender_proportion)
+
+cat("\n==== 年龄范围 ====\n")
+print(age_range)
+```
+
+```{R}
+# ============================================================
+# 2) 通用设置与函数
+# ============================================================
+
+# 2.1 原始 cutoff
+cutoff_DSRSC <- 15
+cutoff_PHQ   <- 10
+cutoff_CDI   <- 20
+cutoff_DASS_male   <- 4
+cutoff_DASS_female <- 5
+
+# 2.2 年龄分组
+age_groups <- list(
+  "7-12"  = 7:12,
+  "13-15" = 13:15,
+  "16-18" = 16:18
+)
+
+# 2.3 安全计算百分比
+calc_rate <- function(df, det_col) {
+  if (nrow(df) == 0) return(NA_real_)
+  mean(df[[det_col]], na.rm = TRUE) * 100
+}
+
+# 2.4 overlap 分组函数
+build_overlap_counts <- function(df, det_prefix) {
+  df %>%
+    transmute(
+      ID,
+      DSRSC = as.integer(.data[[paste0(det_prefix, "DSRSC")]]),
+      PHQ   = as.integer(.data[[paste0(det_prefix, "PHQ")]]),
+      CDI   = as.integer(.data[[paste0(det_prefix, "CDI")]]),
+      DASS  = as.integer(.data[[paste0(det_prefix, "DASS")]])
+    ) %>%
+    mutate(
+      total_detected = DSRSC + PHQ + CDI + DASS,
+      group = case_when(
+        total_detected == 4 ~ "All four detected",
+
+        total_detected == 3 & DSRSC == 0 ~ "Only PHQ + CDI + DASS",
+        total_detected == 3 & PHQ == 0 ~ "Only DSRSC + CDI + DASS",
+        total_detected == 3 & CDI == 0 ~ "Only DSRSC + PHQ + DASS",
+        total_detected == 3 & DASS == 0 ~ "Only DSRSC + PHQ + CDI",
+
+        total_detected == 2 & DSRSC == 1 & PHQ == 1 ~ "Only DSRSC + PHQ",
+        total_detected == 2 & DSRSC == 1 & CDI == 1 ~ "Only DSRSC + CDI",
+        total_detected == 2 & DSRSC == 1 & DASS == 1 ~ "Only DSRSC + DASS",
+        total_detected == 2 & PHQ == 1 & CDI == 1 ~ "Only PHQ + CDI",
+        total_detected == 2 & PHQ == 1 & DASS == 1 ~ "Only PHQ + DASS",
+        total_detected == 2 & CDI == 1 & DASS == 1 ~ "Only CDI + DASS",
+
+        total_detected == 1 & DSRSC == 1 ~ "Only DSRSC",
+        total_detected == 1 & PHQ == 1 ~ "Only PHQ",
+        total_detected == 1 & CDI == 1 ~ "Only CDI",
+        total_detected == 1 & DASS == 1 ~ "Only DASS",
+
+        TRUE ~ "Other/Unclassified"
+      ),
+      level = case_when(
+        total_detected == 4 ~ "4_detected",
+        total_detected == 3 ~ "3_detected",
+        total_detected == 2 ~ "2_detected",
+        total_detected == 1 ~ "1_detected",
+        TRUE ~ "Other"
+      )
+    ) %>%
+    filter(group != "Other/Unclassified", level != "Other") %>%
+    group_by(group, level) %>%
+    summarise(count = n(), .groups = "drop") %>%
+    filter(count > 0) %>%
+    arrange(desc(count))
+}
+
+# 2.5 年龄组折线图数据函数
+build_age_line_data <- function(df, prefix) {
+  age_data <- purrr::map_dfr(names(age_groups), function(g) {
+    ages <- age_groups[[g]]
+    tmp <- df %>% filter(Age %in% ages)
+
+    tibble(
+      Age_Group = g,
+      Measure = c("DSRSC", "PHQ-9", "CDI", "DASS"),
+      Detection_Rate = c(
+        calc_rate(tmp, paste0(prefix, "DSRSC")),
+        calc_rate(tmp, paste0(prefix, "PHQ")),
+        calc_rate(tmp, paste0(prefix, "CDI")),
+        calc_rate(tmp, paste0(prefix, "DASS"))
+      )
+    )
+  })
+
+  overall_data <- tibble(
+    Age_Group = "Overall",
+    Measure = c("DSRSC", "PHQ-9", "CDI", "DASS"),
+    Detection_Rate = c(
+      calc_rate(df, paste0(prefix, "DSRSC")),
+      calc_rate(df, paste0(prefix, "PHQ")),
+      calc_rate(df, paste0(prefix, "CDI")),
+      calc_rate(df, paste0(prefix, "DASS"))
+    )
+  )
+
+  out <- bind_rows(overall_data, age_data) %>%
+    mutate(Age_Group = factor(Age_Group, levels = c("Overall", "7-12", "13-15", "16-18")))
+
+  mean_order <- out %>%
+    group_by(Measure) %>%
+    summarise(Average_Detection_Rate = mean(Detection_Rate, na.rm = TRUE), .groups = "drop") %>%
+    arrange(desc(Average_Detection_Rate))
+
+  out$Measure <- factor(out$Measure, levels = mean_order$Measure)
+  out
+}
+```
+
+```{R}
+# ============================================================
+# 3) 协调前（Pre-harmonization）
+# ============================================================
+
+# 3.1 原始总分
+pre_dsrsc_total <- rowSums(analysis_data[, dsrsc_items], na.rm = TRUE)
+pre_phq_total   <- rowSums(analysis_data[, phq_items], na.rm = TRUE)
+pre_cdi_total   <- rowSums(analysis_data[, cdi_items_scored], na.rm = TRUE)
+pre_dass_total  <- rowSums(analysis_data[, dass_items], na.rm = TRUE)
+
+# 3.2 DASS 个体阈值
+pre_dass_cutoff <- ifelse(analysis_data$Gender == 1, cutoff_DASS_male, cutoff_DASS_female)
+
+# 3.3 协调前检出标记
+pre_data <- analysis_data %>%
+  transmute(
+    ID,
+    Gender,
+    Age,
+    pre_dsrsc_total = pre_dsrsc_total,
+    pre_phq_total   = pre_phq_total,
+    pre_cdi_total   = pre_cdi_total,
+    pre_dass_total  = pre_dass_total,
+    pre_det_DSRSC = pre_dsrsc_total >= cutoff_DSRSC,
+    pre_det_PHQ   = pre_phq_total   >= cutoff_PHQ,
+    pre_det_CDI   = pre_cdi_total   >= cutoff_CDI,
+    pre_det_DASS  = pre_dass_total  >= pre_dass_cutoff
+  )
+
+# 3.4 协调前 treemap 数据
+pre_group_counts <- build_overlap_counts(pre_data, "pre_det_")
+
+# 3.5 协调前年龄组折线数据
+pre_line_data <- build_age_line_data(pre_data, "pre_det_")
+
+# 3.6 协调前折线图
+p_pre_line <- ggplot(
+  pre_line_data,
+  aes(x = Measure, y = Detection_Rate, group = Age_Group, color = Age_Group)
+) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  papaja::theme_apa(base_size = 22) +
+  labs(
+    x = NULL,
+    y = "Detection Rate (%)",
+    title = "Pre-harmonization Detection Rates by Measure and Age Group"
+  ) +
+  scale_color_manual(values = c(
+    "Overall" = "gray40",
+    "7-12"    = "#2ca02c",
+    "13-15"   = "#1f77b4",
+    "16-18"   = "#ff7f0e"
+  )) +
+  scale_y_continuous(limits = c(0, 80), expand = c(0, 0)) +
+  scale_x_discrete(expand = c(0.2, 0)) +
+  guides(color = guide_legend(title = "Group"))
+
+# 3.7 协调前 treemap
+p_pre_treemap <- ggplot(
+  pre_group_counts,
+  aes(area = count, fill = level, label = paste0(group, "\n", count))
+) +
+  geom_treemap() +
+  geom_treemap_text(colour = "white", place = "centre", grow = TRUE, reflow = TRUE) +
+  papaja::theme_apa(base_size = 22) +
+  labs(
+    title = "Pre-harmonization: Distribution of Detection Condition",
+    fill = "Detected Level"
+  ) +
+  scale_fill_manual(values = c(
+    "4_detected" = "#08306b",
+    "3_detected" = "#2171b5",
+    "2_detected" = "#6baed6",
+    "1_detected" = "#c6dbef"
+  ))
+
+# 3.8 协调前组合图
+p_pre_combined <- p_pre_line + p_pre_treemap +
+  plot_layout(ncol = 2) +
+  plot_annotation(
+    tag_levels = "A",
+    theme = theme(plot.tag = element_text(size = 20, face = "bold"))
+  )
+
+# 3.9 导出
+ggsave(
+  here::here("figure", "pre_final_combined_plot.png"),
+  p_pre_combined, width = 20, height = 6, dpi = 300
+)
+
+openxlsx::write.xlsx(
+  pre_line_data %>% mutate(Detection_Rate = round(Detection_Rate, 2)),
+  here::here("output", "pre_detection_rates_by_age.xlsx"),
+  overwrite = TRUE
+)
+
+openxlsx::write.xlsx(
+  pre_group_counts,
+  here::here("output", "pre_treemap_group_counts.xlsx"),
+  overwrite = TRUE
+)
+
+cat("\n==== 协调前 treemap 组合人数 ====\n")
+print(pre_group_counts)
+
+cat("\n==== 协调前年龄组检出率 ====\n")
+print(pre_line_data)
+
+
+```
+
+```{R}
+# ============================================================
+# 4) 数据协调（Harmonization）
+# ============================================================
+
+# 4.1 全题数据
+harm_data0 <- analysis_data %>%
+  select(all_of(c(dsrsc_items, phq_items, dass_items, cdi_items_scored)))
+
+# 4.2 共同单维 GRM
+harm_fit_all <- mirt(harm_data0, 1, itemtype = "graded", SE = FALSE)
+
+# 4.3 构建 crosswalk 函数
+build_walk <- function(scale_dat, fit_all_model) {
+  tmp <- mirt(scale_dat, 1, itemtype = "graded")
+  sv2 <- mod2values(tmp)
+  uni <- mod2values(fit_all_model)
+
+  # 优先使用 item + name + class 联合匹配；
+  # 若 class 列不存在，则退回 item + name
+  if (all(c("item", "name", "class") %in% names(sv2)) &&
+      all(c("item", "name", "class") %in% names(uni))) {
+
+    sv2$key <- paste(sv2$item, sv2$name, sv2$class, sep = " | ")
+    uni$key <- paste(uni$item, uni$name, uni$class, sep = " | ")
+
+  } else {
+
+    sv2$key <- paste(sv2$item, sv2$name, sep = " | ")
+    uni$key <- paste(uni$item, uni$name, sep = " | ")
+  }
+
+  idx <- match(sv2$key, uni$key)
+
+  if (any(is.na(idx))) {
+    bad_cols <- intersect(c("item", "name", "class"), names(sv2))
+    bad <- sv2[is.na(idx), bad_cols, drop = FALSE]
+    message("以下参数在共同模型中找不到（前30个）：")
+    print(head(bad, 30))
+    stop("Crosswalk 参数匹配失败：通常是题目命名不一致，或 itemtype / 类别数不一致。")
+  }
+
+  # 再检查是否仍有重复匹配
+  if (length(unique(idx)) != length(idx)) {
+    stop("联合匹配后仍存在重复匹配，需进一步检查。")
+  }
+
+  sv2$value <- uni$value[idx]
+  sv2$est <- FALSE
+
+  walk <- mirt(scale_dat, 1, itemtype = "graded", pars = sv2)
+
+  list(
+    walk = walk,
+    eap = fscores(walk, method = "EAP", full.scores.SE = FALSE),
+    eapsum = fscores(walk, method = "EAPsum", full.scores = FALSE, na.rm = TRUE)
+  )
+}
+
+# 4.4 各量表拟合
+walk_DSRSC <- build_walk(analysis_data %>% select(all_of(dsrsc_items)), harm_fit_all)
+walk_PHQ   <- build_walk(analysis_data %>% select(all_of(phq_items)),   harm_fit_all)
+walk_DASS  <- build_walk(analysis_data %>% select(all_of(dass_items)),  harm_fit_all)
+walk_CDI <- build_walk(analysis_data %>% select(all_of(cdi_items_scored)), harm_fit_all)
+
+harm_DSRSCeap    <- as.data.frame(walk_DSRSC$eap)
+harm_PHQeap      <- as.data.frame(walk_PHQ$eap)
+harm_DASSeap     <- as.data.frame(walk_DASS$eap)
+harm_CDIeap      <- as.data.frame(walk_CDI$eap)
+
+harm_DSRSCeapsum <- as.data.frame(walk_DSRSC$eapsum)
+harm_PHQeapsum   <- as.data.frame(walk_PHQ$eapsum)
+harm_DASSeapsum  <- as.data.frame(walk_DASS$eapsum)
+harm_CDIeapsum   <- as.data.frame(walk_CDI$eapsum)
+
+# 4.5 原始 cutoff -> theta cutoff
+harm_cutoff_theta_DSRSC <- harm_DSRSCeapsum$F1[harm_DSRSCeapsum$Sum.Scores == cutoff_DSRSC]
+harm_cutoff_theta_PHQ   <- harm_PHQeapsum$F1[harm_PHQeapsum$Sum.Scores == cutoff_PHQ]
+harm_cutoff_theta_CDI   <- harm_CDIeapsum$F1[harm_CDIeapsum$Sum.Scores == cutoff_CDI]
+harm_cutoff_theta_DASS_male   <- harm_DASSeapsum$F1[harm_DASSeapsum$Sum.Scores == cutoff_DASS_male]
+harm_cutoff_theta_DASS_female <- harm_DASSeapsum$F1[harm_DASSeapsum$Sum.Scores == cutoff_DASS_female]
+
+stopifnot(
+  length(harm_cutoff_theta_DSRSC) == 1,
+  length(harm_cutoff_theta_PHQ) == 1,
+  length(harm_cutoff_theta_CDI) == 1,
+  length(harm_cutoff_theta_DASS_male) == 1,
+  length(harm_cutoff_theta_DASS_female) == 1
+)
+
+```
+
+```{R}
+# ============================================================
+# 5) 协调后（Post-harmonization）
+# ============================================================
+
+# 5.1 theta 主表 + 协调后检出标记
+harm_data <- tibble(
+  ID = analysis_data$ID,
+  Gender = analysis_data$Gender,
+  Age = analysis_data$Age,
+  harm_theta_DSRSC = as.numeric(harm_DSRSCeap$F1),
+  harm_theta_PHQ   = as.numeric(harm_PHQeap$F1),
+  harm_theta_DASS  = as.numeric(harm_DASSeap$F1),
+  harm_theta_CDI   = as.numeric(harm_CDIeap$F1)
+) %>%
+  mutate(
+    harm_det_DSRSC = harm_theta_DSRSC >= harm_cutoff_theta_DSRSC,
+    harm_det_PHQ   = harm_theta_PHQ   >= harm_cutoff_theta_PHQ,
+    harm_det_CDI   = harm_theta_CDI   >= harm_cutoff_theta_CDI,
+    harm_det_DASS  = ifelse(
+      Gender == 1,
+      harm_theta_DASS >= harm_cutoff_theta_DASS_male,
+      harm_theta_DASS >= harm_cutoff_theta_DASS_female
+    )
+  )
+
+# 5.2 协调后 treemap 数据
+harm_group_counts <- build_overlap_counts(harm_data, "harm_det_")
+
+# 5.3 协调后折线图数据
+harm_line_data <- build_age_line_data(harm_data, "harm_det_")
+
+# 5.4 协调后折线图
+p_harm_line <- ggplot(
+  harm_line_data,
+  aes(x = Measure, y = Detection_Rate, group = Age_Group, color = Age_Group)
+) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  papaja::theme_apa(base_size = 22) +
+  labs(
+    x = NULL,
+    y = "Detection Rate (%)",
+    title = "Post-harmonization Detection Rates by Measure and Age Group"
+  ) +
+  scale_color_manual(values = c(
+    "Overall" = "gray40",
+    "7-12"    = "#2ca02c",
+    "13-15"   = "#1f77b4",
+    "16-18"   = "#ff7f0e"
+  )) +
+  scale_y_continuous(limits = c(0, 80), expand = c(0, 0)) +
+  scale_x_discrete(expand = c(0.2, 0)) +
+  guides(color = guide_legend(title = "Group"))
+
+# 5.5 协调后 treemap
+p_harm_treemap <- ggplot(
+  harm_group_counts,
+  aes(area = count, fill = level, label = paste0(group, "\n", count))
+) +
+  geom_treemap() +
+  geom_treemap_text(colour = "white", place = "centre", grow = TRUE, reflow = TRUE) +
+  papaja::theme_apa(base_size = 22) +
+  labs(
+    title = "Post-harmonization: Distribution of Detection Condition",
+    fill = "Detected Level"
+  ) +
+  scale_fill_manual(values = c(
+    "4_detected" = "#08306b",
+    "3_detected" = "#2171b5",
+    "2_detected" = "#6baed6",
+    "1_detected" = "#c6dbef"
+  ))
+
+# 5.6 协调后组合图
+p_harm_combined <- p_harm_line + p_harm_treemap +
+  plot_layout(ncol = 2) +
+  plot_annotation(
+    tag_levels = "A",
+    theme = theme(plot.tag = element_text(size = 20, face = "bold"))
+  )
+
+# 5.7 导出
+ggsave(
+  here::here("figure", "harm_final_combined_plot.png"),
+  p_harm_combined, width = 20, height = 6, dpi = 300
+)
+
+openxlsx::write.xlsx(
+  harm_line_data %>% mutate(Detection_Rate = round(Detection_Rate, 2)),
+  here::here("output", "harm_detection_rates_by_age.xlsx"),
+  overwrite = TRUE
+)
+
+openxlsx::write.xlsx(
+  harm_group_counts,
+  here::here("output", "harm_treemap_group_counts.xlsx"),
+  overwrite = TRUE
+)
+
+cat("\n==== 协调后 treemap 组合人数 ====\n")
+print(harm_group_counts)
+
+cat("\n==== 协调后年龄组检出率 ====\n")
+print(harm_line_data)
+
+```
+
+```{R}
+# ============================================================
+# 6) 最终总拼图：协调前 + 协调后
+# ============================================================
+
+p_final_compare <- p_pre_combined / p_harm_combined +
+  plot_annotation(
+    tag_levels = "A",
+    theme = theme(
+      plot.tag = element_text(size = 16, face = "bold"),
+      plot.margin = margin(10, 10, 10, 20)
+    )
+  )
+
+ggsave(
+  here::here("figure", "final_compare_pre_vs_harmonized.png"),
+  p_final_compare,
+  width = 22,
+  height = 12,
+  dpi = 300
+)
+```
+
+```{R}
+#检验
+summary(harm_fit_all)
+M2(harm_fit_all)
+```

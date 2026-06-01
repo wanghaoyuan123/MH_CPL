@@ -1,0 +1,1369 @@
+---
+title: "Untitled"
+author: "why"
+date: "2025-11-15"
+output: html_document
+---
+
+
+```{r}
+library(readxl)
+library(dplyr)
+library(here)
+library(openxlsx)
+
+#==========================================================
+# 1. 读取原始数据
+#==========================================================
+raw <- read_excel(here("DATA", "Rawdata1.xlsx"))
+cmp <- read_excel(here("DATA", "Complains_YoungClients.xls"))
+
+#==========================================================
+# 2. 清理 ID
+#==========================================================
+raw <- raw %>%
+  mutate(ID_clean = trimws(as.character(ID)))
+
+cmp <- cmp %>%
+  mutate(门诊ID_clean = trimws(as.character(门诊ID)))
+
+raw_ids <- raw %>%
+  filter(!is.na(ID_clean), ID_clean != "") %>%
+  distinct(ID_clean)
+
+cmp_ids <- cmp %>%
+  filter(!is.na(门诊ID_clean), 门诊ID_clean != "") %>%
+  distinct(门诊ID_clean)
+
+#==========================================================
+# 3. Raw 有、Complains 没有的 ID
+#==========================================================
+raw_id_not_in_cmp <- raw_ids %>%
+  anti_join(cmp_ids, by = c("ID_clean" = "门诊ID_clean"))
+
+raw_rows_not_in_cmp <- raw %>%
+  semi_join(raw_id_not_in_cmp, by = "ID_clean")
+
+#==========================================================
+# 4. Complains 有、Raw 没有的 ID
+#==========================================================
+cmp_id_not_in_raw <- cmp_ids %>%
+  anti_join(raw_ids, by = c("门诊ID_clean" = "ID_clean"))
+
+cmp_rows_not_in_raw <- cmp %>%
+  semi_join(cmp_id_not_in_raw, by = "门诊ID_clean")
+
+#==========================================================
+# 5. 汇总
+#==========================================================
+summary_df <- data.frame(
+  item = c(
+    "Rawdata1 唯一有效 ID 数",
+    "Complains 唯一有效 ID 数",
+    "Rawdata1 中有、Complains 中没有的唯一 ID 数",
+    "Rawdata1 中这些 ID 对应的原始行数",
+    "Complains 中有、Rawdata1 中没有的唯一 ID 数",
+    "Complains 中这些 ID 对应的原始行数"
+  ),
+  n = c(
+    nrow(raw_ids),
+    nrow(cmp_ids),
+    nrow(raw_id_not_in_cmp),
+    nrow(raw_rows_not_in_cmp),
+    nrow(cmp_id_not_in_raw),
+    nrow(cmp_rows_not_in_raw)
+  )
+)
+
+print(summary_df)
+
+#==========================================================
+# 6. 导出
+#==========================================================
+write.xlsx(
+  list(
+    Summary = summary_df,
+    Raw_ID_not_in_Complains = raw_id_not_in_cmp,
+    Raw_rows_not_in_Complains = raw_rows_not_in_cmp,
+    Complains_ID_not_in_Raw = cmp_id_not_in_raw,
+    Complains_rows_not_in_Raw = cmp_rows_not_in_raw
+  ),
+  here("OUTPUT", "ID_mismatch_check.xlsx"),
+  overwrite = TRUE
+)
+
+cat("\nID 不匹配核查完成，结果已导出：OUTPUT/ID_mismatch_check.xlsx\n")
+
+```
+
+
+```{r}
+# 预处理是将RAWDATA1和Complains_YoungClients（即未经处理的医生原始数据）进行处理的代码，处理规则如下：
+# 在本研究的数据预处理中，Rawdata1.xlsx 与 Complains_YoungClients.xls 两个数据表均包含重复的 ID。
+# 为了确保后续分析中每个 ID 仅保留一条最合适的记录，我们制定并实施了如下匹配与筛选规则：
+# 1. 两个数据表均出现的 ID（共同 ID）
+# 当某个 ID 同时存在于 Rawdata1 与 Complains 数据表中，且各自都可能有多条记录时：
+# 规则：找到 Raw 中每条记录与 Complains 中每条记录之间的时间差，保留时间差最小的那一对。
+# Raw 表使用字段：提交时间（parsed datetime）
+# Complains 表使用字段：就诊日期（parsed datetime）
+# 对所有组合计算时间差（绝对值，单位秒）选择时间差最小的一对 仅保留这一行 Raw 及这一行 Complains 其余记录全部删除
+# 这样保证共同 ID 在两个文件中都仅保留 最匹配的、最接近的时间点。
+# 2. 仅在 Rawdata1 中出现的 ID
+# 当某个 ID 出现在 Rawdata1 中，但不出现在 Complains 中时：
+# 规则：保留 Rawdata1 中该 ID 的所有记录里 “提交时间最早” 的一条。
+# 同时删除该 ID 的其他记录
+# 这样保证 Raw 中的独有 ID 也只保留一条最合理的数据。
+# 3. 仅在 Complains_YoungClients 中出现的 ID
+# 当某个 ID 出现在 Complains 中，但 不出现在 Rawdata1 中时：
+# 规则：保留 Complains 中该 ID 的所有记录里 “就诊日期最早” 的一条。
+# 同时删除该 ID 的其他记录
+# 这保证 Complains 中的独有 ID 也只保留一条最代表性的记录。
+# 输出数据文件为：Raw_output.xlsx 也是后续检出率和EGA载入的数据文件。
+library(readxl)
+library(dplyr)
+library(lubridate)
+library(here)
+library(openxlsx)
+library(stringr)
+
+#==========================================================
+# 1. 读取数据
+#==========================================================
+raw <- read_excel(here("DATA", "Rawdata1.xlsx"))
+cmp <- read_excel(here("DATA", "Complains_YoungClients.xls"))
+
+# 强制 ID 字段为字符
+raw$ID <- as.character(raw$ID)
+cmp$门诊ID <- as.character(cmp$门诊ID)
+
+#==========================================================
+# 2. 解析 Raw 的提交时间（英文格式 + 数字格式）
+#==========================================================
+
+# 去掉 " CST"
+raw$提交时间_clean <- gsub(" CST", "", raw$提交时间, fixed = TRUE)
+
+# 创建解析结果列
+raw$提交时间_parsed <- NA
+
+# --- 英文格式 (例: Wed May 25 14:04:35 2022) ---
+idx_eng <- grepl("[A-Za-z]{3} [A-Za-z]{3} [0-9]{1,2}", raw$提交时间_clean)
+
+old_locale <- Sys.getlocale("LC_TIME")
+Sys.setlocale("LC_TIME", "C")   # 切到英文环境，识别 Wed / May
+
+raw$提交时间_parsed[idx_eng] <- as.POSIXct(
+  raw$提交时间_clean[idx_eng],
+  format = "%a %b %d %H:%M:%S %Y",
+  tz = "Asia/Shanghai"
+)
+
+Sys.setlocale("LC_TIME", old_locale)  # 解析完恢复
+
+# --- 数字格式 (例: 2023-06-17 10:11:28) ---
+idx_num <- grepl("^\\d{4}-\\d{2}-\\d{2}", raw$提交时间_clean)
+
+raw$提交时间_parsed[idx_num] <- as.POSIXct(
+  raw$提交时间_clean[idx_num],
+  format = "%Y-%m-%d %H:%M:%S",
+  tz = "Asia/Shanghai"
+)
+
+#==========================================================
+# 3. 解析 Complains 的就诊日期
+#==========================================================
+cmp$就诊日期_parsed <- as.POSIXct(
+  cmp$就诊日期,
+  format = "%Y/%m/%d %H:%M:%S",
+  tz = "Asia/Shanghai"
+)
+
+#==========================================================
+# 4. ID 分类
+#==========================================================
+common_ids <- intersect(raw$ID, cmp$门诊ID)
+only_raw_ids <- setdiff(raw$ID, cmp$门诊ID)
+only_cmp_ids <- setdiff(cmp$门诊ID, raw$ID)
+
+#==========================================================
+# 5. 共同 ID —— Raw & Complains 时间最接近的一对
+#==========================================================
+matched_pairs <- raw %>%
+  filter(ID %in% common_ids) %>%
+  left_join(cmp, by = c("ID" = "门诊ID")) %>%
+  mutate(
+    time_diff = abs(as.numeric(
+      difftime(提交时间_parsed, 就诊日期_parsed, units = "secs")
+    )),
+    time_diff = ifelse(is.na(time_diff), Inf, time_diff)
+  ) %>%
+  group_by(ID) %>%                          # 每个 ID 只留一行（时间最近）
+  slice_min(time_diff, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+#==========================================================
+# 6. Raw 独有 ID —— 保留提交时间最早
+#==========================================================
+raw_only <- raw %>%
+  filter(ID %in% only_raw_ids) %>%
+  group_by(ID) %>%
+  slice_min(提交时间_parsed, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+#==========================================================
+# 7. Complains 独有 ID —— 保留最早就诊时间
+#==========================================================
+cmp_only <- cmp %>%
+  filter(门诊ID %in% only_cmp_ids) %>%
+  group_by(门诊ID) %>%
+  slice_min(就诊日期_parsed, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+#==========================================================
+# 8. 组合 Raw 输出数据：每个 Raw ID 一行
+#==========================================================
+Raw_output <- bind_rows(
+  matched_pairs %>% select(any_of(names(raw))),  # 共同 ID 的 Raw 行
+  raw_only                                      # Raw 独有 ID
+)
+
+#==========================================================
+# 9. 组合 Complains 输出数据：每个 门诊ID 一行
+#==========================================================
+# 先准备一份“来自 matched_pairs 的 Complains 视角”：把 ID 当成 门诊ID 用
+cmp_cols <- names(cmp)
+
+cmp_from_matched <- matched_pairs %>%
+  mutate(门诊ID = ID) %>%            # 加回 Complains 的键
+  select(all_of(cmp_cols))           # 按 Complains 原始列顺序取列
+
+# 再和 Complains 独有的行拼在一起
+Cmp_output <- bind_rows(
+  cmp_from_matched,
+  cmp_only
+)
+
+#==========================================================
+# 10. 输出 Excel 文件（不会乱码）
+#==========================================================
+write.xlsx(Raw_output,
+           here("OUTPUT", "Raw_output.xlsx"),
+           overwrite = TRUE)
+
+write.xlsx(Cmp_output,
+           here("OUTPUT", "Complains_output.xlsx"),
+           overwrite = TRUE)
+
+cat("全部处理完成！Excel 文件已生成到 OUTPUT 文件夹（两个文件各自每个 ID 只保留一行）。\n")
+
+
+
+
+```
+
+
+
+
+
+```{r}
+# ============================================================
+# 1. 清洗病历数据
+#    - 现病史非空
+#    - 年龄 7-18
+#    - 去掉代诊
+#    - 标准化诊断字段
+# ============================================================
+Cmp_step1 <- Cmp_output %>%
+  filter(
+    !is.na(现病史),
+    trimws(as.character(现病史)) != ""
+  )
+
+Cmp_step1 <- Cmp_step1 %>%
+  mutate(
+    出生日期_parsed = as.Date(出生日期, format = "%Y/%m/%d"),
+    就诊日期_parsed = as.Date(就诊日期, format = "%Y/%m/%d"),
+    Age = as.numeric(difftime(就诊日期_parsed, 出生日期_parsed, units = "days")) / 365.25
+  )
+
+Cmp_step2 <- Cmp_step1 %>%
+  filter(Age >= 7 & Age <= 18)
+
+Cmp_step3 <- Cmp_step2 %>%
+  filter(!grepl("代诊", 主诉))
+
+Cmp_step3 <- Cmp_step3 %>%
+  filter(!is.na(诊断), trimws(as.character(诊断)) != "") %>%
+  mutate(
+    诊断_clean = as.character(诊断),
+    诊断_clean = str_replace_all(诊断_clean, "[\r\n\t]", ""),
+    诊断_clean = str_squish(诊断_clean),
+    诊断_clean = str_replace(诊断_clean, ";+$", "")   # 去掉末尾分号
+  )
+
+cat("病历清洗后样本量：", nrow(Cmp_step3), "\n")
+
+# ============================================================
+# 2. 定义“纯抑郁”
+#    只保留：抑郁状态 / 抑郁障碍
+# ============================================================
+pure_dep_labels <- c("抑郁状态", "抑郁障碍")
+
+Cmp_depression_pure <- Cmp_step3 %>%
+  filter(诊断_clean %in% pure_dep_labels)
+
+Cmp_non_depression <- Cmp_step3 %>%
+  filter(!str_detect(诊断_clean, "抑郁"))
+
+cat("纯抑郁样本量：", nrow(Cmp_depression_pure), "\n")
+cat("非抑郁样本量：", nrow(Cmp_non_depression), "\n")
+
+# 导出纯抑郁 / 非抑郁病历
+write.xlsx(
+  Cmp_depression_pure,
+  here("OUTPUT", "Complains_output_depression_pure.xlsx"),
+  overwrite = TRUE
+)
+
+write.xlsx(
+  Cmp_non_depression,
+  here("OUTPUT", "Complains_output_non_depression.xlsx"),
+  overwrite = TRUE
+)
+
+cat("已导出：\n")
+cat("  - Complains_output_depression_pure.xlsx\n")
+cat("  - Complains_output_non_depression.xlsx\n")
+
+# ============================================================
+# 3. 给问卷数据打标签（纯抑郁 / 非抑郁）
+# ============================================================
+Dep_label <- bind_rows(
+  Cmp_depression_pure %>%
+    transmute(
+      ID = as.character(门诊ID),
+      Depression_status = "Depression"
+    ),
+  Cmp_non_depression %>%
+    transmute(
+      ID = as.character(门诊ID),
+      Depression_status = "Non-depression"
+    )
+) %>%
+  distinct(ID, .keep_all = TRUE)
+
+Raw_with_label <- Raw_output %>%
+  left_join(Dep_label, by = "ID")
+
+Raw_labeled <- Raw_with_label %>%
+  filter(!is.na(Depression_status))
+
+Raw_depression <- Raw_labeled %>%
+  filter(Depression_status == "Depression")
+
+Raw_non_depression <- Raw_labeled %>%
+  filter(Depression_status == "Non-depression")
+
+cat("问卷中纯抑郁样本量：", nrow(Raw_depression), "\n")
+cat("问卷中非抑郁样本量：", nrow(Raw_non_depression), "\n")
+
+write.xlsx(
+  Raw_labeled,
+  here("OUTPUT", "Questionnaire_With_Diagnosis_Label_Pure.xlsx"),
+  overwrite = TRUE
+)
+
+write.xlsx(
+  Raw_depression,
+  here("OUTPUT", "Questionnaire_Depression_Pure.xlsx"),
+  overwrite = TRUE
+)
+
+write.xlsx(
+  Raw_non_depression,
+  here("OUTPUT", "Questionnaire_Non_Depression.xlsx"),
+  overwrite = TRUE
+)
+
+cat("已导出：\n")
+cat("  - Questionnaire_With_Diagnosis_Label_Pure.xlsx\n")
+cat("  - Questionnaire_Depression_Pure.xlsx\n")
+cat("  - Questionnaire_Non_Depression.xlsx\n")
+
+# ============================================================
+# 4. 构建建模数据（纯抑郁 vs 非抑郁）
+#    仅保留病历和问卷都存在的人
+#    1:1 平衡抽样
+# ============================================================
+dep_pool <- Cmp_depression_pure %>%
+  mutate(ID = as.character(门诊ID)) %>%
+  filter(ID %in% Raw_output$ID)
+
+non_pool <- Cmp_non_depression %>%
+  mutate(ID = as.character(门诊ID)) %>%
+  filter(ID %in% Raw_output$ID)
+
+n_dep <- nrow(dep_pool)
+cat("可用于建模的纯抑郁样本数（病历∩问卷）：", n_dep, "\n")
+
+if (nrow(non_pool) < n_dep) {
+  stop("非抑郁池子数量不足，无法做1:1平衡抽样。")
+}
+
+dep_sel <- dep_pool %>%
+  transmute(
+    ID = ID,
+    history_text = 现病史,
+    label = 1
+  )
+
+set.seed(20240211)
+non_sel <- non_pool %>%
+  slice_sample(n = n_dep) %>%
+  transmute(
+    ID = ID,
+    history_text = 现病史,
+    label = 0
+  )
+
+y_label <- bind_rows(dep_sel, non_sel) %>%
+  distinct(ID, .keep_all = TRUE)
+
+cat("平衡后总样本数：", nrow(y_label), "\n")
+print(table(y_label$label))
+
+# ============================================================
+# 5. 问卷计分
+# ============================================================
+CDI_reverse_items <- c(
+  "CDI2","CDI5","CDI7","CDI8","CDI10","CDI11","CDI13",
+  "CDI15","CDI16","CDI18","CDI21","CDI24","CDI25"
+)
+
+DSRSC_reverse_items <- c(
+  "DSRSC3","DSRSC5","DSRSC6","DSRSC10",
+  "DSRSC14","DSRSC15","DSRSC17","DSRSC18"
+)
+
+DASS_dep_items <- c(
+  "DASS3","DASS5","DASS10",
+  "DASS13","DASS16","DASS17","DASS21"
+)
+
+qdat <- Raw_output %>%
+  filter(ID %in% y_label$ID) %>%
+  mutate(across(matches("Gender|Age|DSRSC|PHQ|CDI"), as.numeric)) %>%
+  mutate(across(matches("DSRSC|PHQ|CDI"), ~ .x - 1)) %>%
+  mutate(across(all_of(DASS_dep_items), as.numeric)) %>%
+  mutate(across(all_of(DASS_dep_items), ~ .x - 1)) %>%
+  mutate(across(all_of(intersect(names(.), CDI_reverse_items)), ~ 2 - .x)) %>%
+  mutate(across(all_of(intersect(names(.), DSRSC_reverse_items)), ~ 2 - .x)) %>%
+  mutate(
+    total_DSRSC = rowSums(select(., starts_with("DSRSC")), na.rm = TRUE),
+    total_PHQ   = rowSums(select(., starts_with("PHQ")),   na.rm = TRUE),
+    total_DASS  = rowSums(select(., all_of(DASS_dep_items)), na.rm = TRUE),
+    total_CDI   = rowSums(select(., starts_with("CDI")),   na.rm = TRUE) -
+                  ifelse("CDI26" %in% names(.), CDI26, 0)
+  ) %>%
+  select(ID, total_DSRSC, total_PHQ, total_CDI, total_DASS)
+
+cat("成功拿到量表总分的样本数：", nrow(qdat), "\n")
+
+# ============================================================
+# 6. 合并为机器学习数据
+# ============================================================
+ml_data <- y_label %>%
+  inner_join(qdat, by = "ID") %>%
+  filter(!is.na(history_text), trimws(history_text) != "")
+
+cat("最终用于建模的样本数：", nrow(ml_data), "\n")
+print(table(ml_data$label))
+
+# ============================================================
+# 7. 生成 5-fold
+# ============================================================
+make_stratified_folds <- function(labels, k = 5, seed = 20240211) {
+  set.seed(seed)
+  folds <- integer(length(labels))
+  for (lab in sort(unique(labels))) {
+    idx <- which(labels == lab)
+    folds[idx] <- sample(rep(1:k, length.out = length(idx)))
+  }
+  folds
+}
+
+ml_data <- ml_data %>%
+  mutate(fold = make_stratified_folds(label, k = 5, seed = 20240211)) %>%
+  arrange(fold, desc(label))
+
+# ============================================================
+# 8. 导出机器学习数据
+# ============================================================
+write.xlsx(
+  ml_data,
+  here("OUTPUT", "ML_dataset_balanced_5fold_pure_depression.xlsx"),
+  overwrite = TRUE
+)
+
+cat("已导出：OUTPUT/ML_dataset_balanced_5fold_pure_depression.xlsx\n")
+
+```
+
+
+```{r}
+
+library(readr)
+library(stringr)
+# =========================================================
+# 9. 基于纯抑郁版 ML 数据生成 M4 文本
+# =========================================================
+ml_data_base <- read_excel(
+  here("OUTPUT", "ML_dataset_balanced_5fold_pure_depression.xlsx")
+) %>%
+  mutate(
+    ID = as.character(ID),
+    history_text = as.character(history_text)
+  )
+
+delete_m4 <- read_lines(
+  here("OUTPUT", "delete_for_M4_augmented_pure.txt"),
+  locale = locale(encoding = "UTF-8")
+) %>%
+  str_squish() %>%
+  unique()
+
+delete_m4 <- delete_m4[delete_m4 != ""]
+delete_m4 <- delete_m4[order(nchar(delete_m4), decreasing = TRUE)]
+
+cat("M4 删除表述数量：", length(delete_m4), "\n")
+
+remove_phrases_raw <- function(text, patterns) {
+  if (is.na(text) || str_squish(text) == "") {
+    return("")
+  }
+
+  out <- text
+  for (p in patterns) {
+    out <- str_replace_all(out, fixed(p), "")
+  }
+  out
+}
+
+clean_text <- function(text) {
+  if (is.na(text) || text == "") {
+    return("[NO_RELEVANT_TEXT]")
+  }
+
+  out <- text
+  out <- str_replace_all(out, "[\r\n\t]", "")
+  out <- str_replace_all(out, "\\s+", "")
+  out <- str_replace_all(out, "[，,]{2,}", "，")
+  out <- str_replace_all(out, "[。]{2,}", "。")
+  out <- str_replace_all(out, "[；;]{2,}", "；")
+  out <- str_replace(out, "^[，,。；;、]+", "")
+  out <- str_replace(out, "[，,。；;、]+$", "")
+  out <- str_squish(out)
+
+  if (out == "") out <- "[NO_RELEVANT_TEXT]"
+  out
+}
+
+ml_data_m4 <- ml_data_base %>%
+  mutate(
+    text_M4_raw = vapply(history_text, remove_phrases_raw, character(1), patterns = delete_m4),
+    text_M4 = vapply(text_M4_raw, clean_text, character(1))
+  )
+
+changed_idx_m4 <- ml_data_m4$history_text != ml_data_m4$text_M4_raw
+
+cat("M4 真正删到表述的样本数：", sum(changed_idx_m4), "\n")
+cat("M4 变成 [NO_RELEVANT_TEXT] 的样本数：", sum(ml_data_m4$text_M4 == "[NO_RELEVANT_TEXT]"), "\n")
+
+write.xlsx(
+  ml_data_m4 %>% select(-text_M4_raw),
+  here("OUTPUT", "ML_dataset_balanced_5fold_text_M4_pure_depression.xlsx"),
+  overwrite = TRUE
+)
+
+cat("已导出：OUTPUT/ML_dataset_balanced_5fold_text_M4_pure_depression.xlsx\n")
+
+
+# =========================================================
+# 10. 基于纯抑郁版 ML 数据生成 M3 文本
+# =========================================================
+delete_m3 <- read_lines(
+  here("OUTPUT", "delete_for_M3_augmented_pure.txt"),
+  locale = locale(encoding = "UTF-8")
+) %>%
+  str_squish() %>%
+  unique()
+
+delete_m3 <- delete_m3[delete_m3 != ""]
+delete_m3 <- delete_m3[order(nchar(delete_m3), decreasing = TRUE)]
+
+cat("M3 删除表述数量：", length(delete_m3), "\n")
+
+ml_data_m3 <- ml_data_base %>%
+  mutate(
+    text_M3_raw = vapply(history_text, remove_phrases_raw, character(1), patterns = delete_m3),
+    text_M3 = vapply(text_M3_raw, clean_text, character(1))
+  )
+
+changed_idx_m3 <- ml_data_m3$history_text != ml_data_m3$text_M3_raw
+
+cat("M3 真正删到表述的样本数：", sum(changed_idx_m3), "\n")
+cat("M3 变成 [NO_RELEVANT_TEXT] 的样本数：", sum(ml_data_m3$text_M3 == "[NO_RELEVANT_TEXT]"), "\n")
+
+write.xlsx(
+  ml_data_m3 %>% select(-text_M3_raw),
+  here("OUTPUT", "ML_dataset_balanced_5fold_text_M3_pure_depression.xlsx"),
+  overwrite = TRUE
+)
+
+cat("已导出：OUTPUT/ML_dataset_balanced_5fold_text_M3_pure_depression.xlsx\n")
+
+```
+
+
+```{r}
+library(readxl)
+library(dplyr)
+library(stringr)
+library(readr)
+library(openxlsx)
+library(here)
+library(purrr)
+
+# =========================================================
+# 0. 读取纯抑郁版机器学习总数据
+# =========================================================
+ml_data <- read_excel(
+  here("OUTPUT", "ML_dataset_balanced_5fold_pure_depression.xlsx")
+) %>%
+  mutate(
+    ID = as.character(ID),
+    history_text = as.character(history_text),
+    label = as.integer(label)
+  )
+
+cat("总样本数：", nrow(ml_data), "\n")
+cat("抑郁组样本数：", sum(ml_data$label == 1), "\n")
+cat("非抑郁组样本数：", sum(ml_data$label == 0), "\n")
+
+# =========================================================
+# 1. 读取删词表（纯抑郁版）
+#    注意：仍然按长度从长到短排序
+# =========================================================
+delete_m3 <- read_lines(
+  here("OUTPUT", "delete_for_M3_pure.txt"),
+  locale = locale(encoding = "UTF-8")
+) %>%
+  str_squish() %>%
+  unique()
+
+delete_m3 <- delete_m3[delete_m3 != ""]
+delete_m3 <- delete_m3[order(nchar(delete_m3), decreasing = TRUE)]
+
+delete_m4 <- read_lines(
+  here("OUTPUT", "delete_for_M4_augmented_pure.txt"),
+  locale = locale(encoding = "UTF-8")
+) %>%
+  str_squish() %>%
+  unique()
+
+delete_m4 <- delete_m4[delete_m4 != ""]
+delete_m4 <- delete_m4[order(nchar(delete_m4), decreasing = TRUE)]
+
+cat("M3 表述数量：", length(delete_m3), "\n")
+cat("M4 表述数量：", length(delete_m4), "\n")
+
+# =========================================================
+# 2. 核心函数：长表述优先，命中后遮罩，避免短表述重复命中
+# =========================================================
+
+# 用同长度遮罩字符替换，避免删掉后前后文本拼接造成误匹配
+mask_phrase_fixed <- function(text, phrase, mask_char = "□") {
+  if (is.na(text) || text == "") return(text)
+  mask_str <- str_dup(mask_char, str_length(phrase))
+  str_replace_all(text, fixed(phrase), mask_str)
+}
+
+# 对一条文本做“非重叠命中检测”
+# 返回：
+# 1) hit_any：是否至少命中一个表述
+# 2) n_hit：命中了多少个“不同表述条目”（非重叠）
+# 3) hit_phrases：真正命中的表述列表（长表述优先，短表述不重复吃到）
+# 4) masked_text：遮罩后的文本（便于debug）
+detect_patterns_nonoverlap <- function(text, patterns) {
+  if (is.na(text) || trimws(text) == "") {
+    return(list(
+      hit_any = FALSE,
+      n_hit = 0L,
+      hit_phrases = character(0),
+      masked_text = text
+    ))
+  }
+
+  working_text <- text
+  hit_phrases <- character(0)
+
+  for (p in patterns) {
+    if (str_detect(working_text, fixed(p))) {
+      hit_phrases <- c(hit_phrases, p)
+      working_text <- mask_phrase_fixed(working_text, p)
+    }
+  }
+
+  list(
+    hit_any = length(hit_phrases) > 0,
+    n_hit = length(hit_phrases),
+    hit_phrases = hit_phrases,
+    masked_text = working_text
+  )
+}
+
+# 批量对一列文本跑非重叠命中
+batch_detect_nonoverlap <- function(text_vec, patterns) {
+  res <- lapply(text_vec, detect_patterns_nonoverlap, patterns = patterns)
+
+  tibble(
+    hit_any = vapply(res, function(x) x$hit_any, logical(1)),
+    n_hit = vapply(res, function(x) x$n_hit, integer(1)),
+    hit_phrases = vapply(res, function(x) paste(x$hit_phrases, collapse = " | "), character(1)),
+    masked_text = vapply(res, function(x) {
+      if (is.null(x$masked_text) || is.na(x$masked_text)) "" else x$masked_text
+    }, character(1))
+  )
+}
+
+# =========================================================
+# 3. 每个样本：是否命中、命中多少（非重叠版）
+# =========================================================
+m3_detect <- batch_detect_nonoverlap(ml_data$history_text, delete_m3)
+m4_detect <- batch_detect_nonoverlap(ml_data$history_text, delete_m4)
+
+ml_hit <- ml_data %>%
+  mutate(
+    hit_any_M3 = m3_detect$hit_any,
+    hit_any_M4 = m4_detect$hit_any,
+    n_hit_M3 = m3_detect$n_hit,
+    n_hit_M4 = m4_detect$n_hit,
+    hit_phrases_M3 = m3_detect$hit_phrases,
+    hit_phrases_M4 = m4_detect$hit_phrases
+  )
+
+write.xlsx(
+  ml_hit,
+  here("OUTPUT", "ML_dataset_phrase_hits_nonoverlap_pure.xlsx"),
+  overwrite = TRUE
+)
+
+cat("已导出样本级命中结果：ML_dataset_phrase_hits_nonoverlap_pure.xlsx\n")
+
+# =========================================================
+# 4. 整体命中率比较（非重叠版）
+# =========================================================
+overall_summary <- ml_hit %>%
+  group_by(label) %>%
+  summarise(
+    n = n(),
+    prop_hit_any_M3 = mean(hit_any_M3),
+    prop_hit_any_M4 = mean(hit_any_M4),
+    mean_n_hit_M3 = mean(n_hit_M3),
+    mean_n_hit_M4 = mean(n_hit_M4),
+    median_n_hit_M3 = median(n_hit_M3),
+    median_n_hit_M4 = median(n_hit_M4),
+    .groups = "drop"
+  ) %>%
+  mutate(group = ifelse(label == 1, "Depression", "Non-depression")) %>%
+  select(group, everything(), -label)
+
+print(overall_summary)
+
+write.xlsx(
+  overall_summary,
+  here("OUTPUT", "Phrase_hit_overall_summary_nonoverlap_pure.xlsx"),
+  overwrite = TRUE
+)
+
+cat("已导出整体命中率表：Phrase_hit_overall_summary_nonoverlap_pure.xlsx\n")
+
+# =========================================================
+# 5. 单表述组间比较（非重叠归属版）
+#    逻辑：
+#    - 每条文本先按“长表述优先”做唯一归属
+#    - 然后统计每个 phrase 在多少个样本中被归属命中
+# =========================================================
+phrase_summary_nonoverlap <- function(data, patterns, prefix_name) {
+  # 先对所有样本做一次非重叠检测
+  det_list <- lapply(data$history_text, detect_patterns_nonoverlap, patterns = patterns)
+
+  # 展开成 样本 x phrase 的归属表
+  hit_rows <- lapply(seq_along(det_list), function(i) {
+    hp <- det_list[[i]]$hit_phrases
+    if (length(hp) == 0) return(NULL)
+
+    data.frame(
+      ID = data$ID[i],
+      label = data$label[i],
+      phrase = hp,
+      stringsAsFactors = FALSE
+    )
+  })
+
+  hit_df <- bind_rows(hit_rows)
+
+  n_dep <- sum(data$label == 1)
+  n_non <- sum(data$label == 0)
+
+  if (nrow(hit_df) == 0) {
+    out <- data.frame(
+      phrase = patterns,
+      dep_hits = 0,
+      non_hits = 0,
+      dep_prop = 0,
+      non_prop = 0,
+      diff_prop = 0,
+      ratio_prop = NA_real_
+    )
+  } else {
+    out <- hit_df %>%
+      group_by(phrase, label) %>%
+      summarise(n = n_distinct(ID), .groups = "drop") %>%
+      tidyr::pivot_wider(
+        names_from = label,
+        values_from = n,
+        values_fill = 0
+      )
+
+    # 防止某一列不存在
+    if (!"0" %in% names(out)) out[["0"]] <- 0
+    if (!"1" %in% names(out)) out[["1"]] <- 0
+
+    out <- out %>%
+      transmute(
+        phrase = phrase,
+        dep_hits = `1`,
+        non_hits = `0`,
+        dep_prop = dep_hits / n_dep,
+        non_prop = non_hits / n_non,
+        diff_prop = dep_prop - non_prop,
+        ratio_prop = ifelse(non_prop == 0, NA, dep_prop / non_prop)
+      ) %>%
+      right_join(
+        data.frame(phrase = patterns, stringsAsFactors = FALSE),
+        by = "phrase"
+      ) %>%
+      mutate(
+        dep_hits = coalesce(dep_hits, 0),
+        non_hits = coalesce(non_hits, 0),
+        dep_prop = coalesce(dep_prop, 0),
+        non_prop = coalesce(non_prop, 0),
+        diff_prop = coalesce(diff_prop, 0),
+        ratio_prop = ifelse(non_prop == 0, NA, dep_prop / non_prop)
+      ) %>%
+      arrange(desc(diff_prop), desc(dep_hits))
+  }
+
+  write.xlsx(
+    out,
+    here("OUTPUT", paste0("Phrase_group_comparison_nonoverlap_", prefix_name, "_pure.xlsx")),
+    overwrite = TRUE
+  )
+
+  cat("已导出：", paste0("Phrase_group_comparison_nonoverlap_", prefix_name, "_pure.xlsx"), "\n")
+  out
+}
+
+m3_phrase_summary <- phrase_summary_nonoverlap(ml_hit, delete_m3, "M3")
+m4_phrase_summary <- phrase_summary_nonoverlap(ml_hit, delete_m4, "M4")
+
+print(head(m3_phrase_summary, 20))
+print(head(m4_phrase_summary, 20))
+
+# =========================================================
+# 6. 对 M3 / M4 单表述做 Fisher 精确检验 + BH校正
+# =========================================================
+
+add_fisher_stats <- function(df, n_dep, n_non) {
+  df %>%
+    rowwise() %>%
+    mutate(
+      fisher_res = list(
+        fisher.test(
+          matrix(
+            c(
+              dep_hits,
+              n_dep - dep_hits,
+              non_hits,
+              n_non - non_hits
+            ),
+            nrow = 2,
+            byrow = TRUE
+          )
+        )
+      ),
+      p_value = fisher_res$p.value,
+      odds_ratio = unname(fisher_res$estimate),
+      conf_low = fisher_res$conf.int[1],
+      conf_high = fisher_res$conf.int[2]
+    ) %>%
+    ungroup() %>%
+    mutate(
+      p_adj_bh = p.adjust(p_value, method = "BH")
+    ) %>%
+    select(
+      phrase,
+      dep_hits, non_hits,
+      dep_prop, non_prop, diff_prop, ratio_prop,
+      odds_ratio, conf_low, conf_high,
+      p_value, p_adj_bh
+    ) %>%
+    arrange(p_adj_bh, desc(diff_prop), desc(dep_hits))
+}
+
+# 当前数据里的两组总人数
+n_dep <- sum(ml_hit$label == 1)
+n_non <- sum(ml_hit$label == 0)
+
+# M3
+m3_phrase_summary_fisher <- add_fisher_stats(
+  m3_phrase_summary,
+  n_dep = n_dep,
+  n_non = n_non
+)
+
+write.xlsx(
+  m3_phrase_summary_fisher,
+  here("OUTPUT", "Phrase_group_comparison_nonoverlap_M3_pure_with_fisher.xlsx"),
+  overwrite = TRUE
+)
+
+cat("已导出：Phrase_group_comparison_nonoverlap_M3_pure_with_fisher.xlsx\n")
+
+# M4
+m4_phrase_summary_fisher <- add_fisher_stats(
+  m4_phrase_summary,
+  n_dep = n_dep,
+  n_non = n_non
+)
+
+write.xlsx(
+  m4_phrase_summary_fisher,
+  here("OUTPUT", "Phrase_group_comparison_nonoverlap_M4_pure_with_fisher.xlsx"),
+  overwrite = TRUE
+)
+
+cat("已导出：Phrase_group_comparison_nonoverlap_M4_pure_with_fisher.xlsx\n")
+
+# =========================================================
+# 7. 打印校正后显著的表述
+# =========================================================
+cat("\n===== M3：BH校正后显著的表述（p_adj_bh < 0.05）=====\n")
+print(
+  m3_phrase_summary_fisher %>%
+    filter(p_adj_bh < 0.05),
+  n = 100
+)
+
+cat("\n===== M4：BH校正后显著的表述（p_adj_bh < 0.05）=====\n")
+print(
+  m4_phrase_summary_fisher %>%
+    filter(p_adj_bh < 0.05),
+  n = 100
+)
+```
+
+
+
+
+```{r}
+# =========================================================
+# 11. 基于纯抑郁版 ML 数据生成 M5 文本
+#     M5 = 删除所有人工整理出的症状表述
+# =========================================================
+
+library(readxl)
+library(dplyr)
+library(stringr)
+library(readr)
+library(openxlsx)
+library(here)
+
+ml_data_base <- read_excel(
+  here("OUTPUT", "ML_dataset_balanced_5fold_pure_depression.xlsx")
+) %>%
+  mutate(
+    ID = as.character(ID),
+    history_text = as.character(history_text)
+  )
+
+# ---------------------------------------------------------
+# 读取 M5 总删词表
+# 建议提前准备：delete_for_M5_pure.txt
+# ---------------------------------------------------------
+delete_m5 <- read_lines(
+  here("OUTPUT", "delete_for_M5_augmented_pure.txt"),
+  locale = locale(encoding = "UTF-8")
+) %>%
+  str_squish() %>%
+  unique()
+
+delete_m5 <- delete_m5[delete_m5 != ""]
+delete_m5 <- delete_m5[order(nchar(delete_m5), decreasing = TRUE)]
+
+cat("M5 删除表述数量：", length(delete_m5), "\n")
+
+# ---------------------------------------------------------
+# 删除函数：从原始 history_text 开始删除
+# ---------------------------------------------------------
+remove_phrases_raw <- function(text, patterns) {
+  if (is.na(text) || str_squish(text) == "") {
+    return("")
+  }
+
+  out <- text
+  for (p in patterns) {
+    out <- str_replace_all(out, fixed(p), "")
+  }
+  out
+}
+
+clean_text <- function(text) {
+  if (is.na(text) || text == "") {
+    return("[NO_RELEVANT_TEXT]")
+  }
+
+  out <- text
+  out <- str_replace_all(out, "[\r\n\t]", "")
+  out <- str_replace_all(out, "\\s+", "")
+  out <- str_replace_all(out, "[，,]{2,}", "，")
+  out <- str_replace_all(out, "[。]{2,}", "。")
+  out <- str_replace_all(out, "[；;]{2,}", "；")
+  out <- str_replace(out, "^[，,。；;、]+", "")
+  out <- str_replace(out, "[，,。；;、]+$", "")
+  out <- str_squish(out)
+
+  if (out == "") out <- "[NO_RELEVANT_TEXT]"
+  out
+}
+
+ml_data_m5 <- ml_data_base %>%
+  mutate(
+    text_M5_raw = vapply(history_text, remove_phrases_raw, character(1), patterns = delete_m5),
+    text_M5 = vapply(text_M5_raw, clean_text, character(1))
+  )
+
+changed_idx_m5 <- ml_data_m5$history_text != ml_data_m5$text_M5_raw
+
+cat("M5 真正删到表述的样本数：", sum(changed_idx_m5), "\n")
+cat("M5 变成 [NO_RELEVANT_TEXT] 的样本数：", sum(ml_data_m5$text_M5 == "[NO_RELEVANT_TEXT]"), "\n")
+
+write.xlsx(
+  ml_data_m5 %>% select(-text_M5_raw),
+  here("OUTPUT", "ML_dataset_balanced_5fold_text_M5_pure_depression.xlsx"),
+  overwrite = TRUE
+)
+
+cat("已导出：OUTPUT/ML_dataset_balanced_5fold_text_M5_pure_depression.xlsx\n")
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+library(readxl)
+library(dplyr)
+library(stringr)
+library(readr)
+library(openxlsx)
+library(here)
+library(purrr)
+library(tidyr)
+
+# =========================================================
+# 0. 读取纯抑郁版机器学习总数据
+# =========================================================
+ml_data <- read_excel(
+  here("OUTPUT", "ML_dataset_balanced_5fold_pure_depression.xlsx")
+) %>%
+  mutate(
+    ID = as.character(ID),
+    history_text = as.character(history_text),
+    label = as.integer(label)
+  )
+
+cat("总样本数：", nrow(ml_data), "\n")
+cat("抑郁组样本数：", sum(ml_data$label == 1), "\n")
+cat("非抑郁组样本数：", sum(ml_data$label == 0), "\n")
+
+# =========================================================
+# 1. 读取 4问卷已覆盖症状对应表述
+# =========================================================
+phrases_4scales <- read_lines(
+  here("OUTPUT", "phrases_measured_by_4scales_pure.txt"),
+  locale = locale(encoding = "UTF-8")
+) %>%
+  str_squish() %>%
+  unique()
+
+phrases_4scales <- phrases_4scales[phrases_4scales != ""]
+phrases_4scales <- phrases_4scales[order(nchar(phrases_4scales), decreasing = TRUE)]
+
+cat("4问卷已覆盖表述数量：", length(phrases_4scales), "\n")
+
+# =========================================================
+# 2. 核心函数：长表述优先，命中后遮罩，避免短表述重复命中
+# =========================================================
+mask_phrase_fixed <- function(text, phrase, mask_char = "□") {
+  if (is.na(text) || text == "") return(text)
+  mask_str <- str_dup(mask_char, str_length(phrase))
+  str_replace_all(text, fixed(phrase), mask_str)
+}
+
+detect_patterns_nonoverlap <- function(text, patterns) {
+  if (is.na(text) || trimws(text) == "") {
+    return(list(
+      hit_any = FALSE,
+      n_hit = 0L,
+      hit_phrases = character(0),
+      masked_text = text
+    ))
+  }
+
+  working_text <- text
+  hit_phrases <- character(0)
+
+  for (p in patterns) {
+    if (str_detect(working_text, fixed(p))) {
+      hit_phrases <- c(hit_phrases, p)
+      working_text <- mask_phrase_fixed(working_text, p)
+    }
+  }
+
+  list(
+    hit_any = length(hit_phrases) > 0,
+    n_hit = length(hit_phrases),
+    hit_phrases = hit_phrases,
+    masked_text = working_text
+  )
+}
+
+batch_detect_nonoverlap <- function(text_vec, patterns) {
+  res <- lapply(text_vec, detect_patterns_nonoverlap, patterns = patterns)
+
+  tibble(
+    hit_any = vapply(res, function(x) x$hit_any, logical(1)),
+    n_hit = vapply(res, function(x) x$n_hit, integer(1)),
+    hit_phrases = vapply(res, function(x) paste(x$hit_phrases, collapse = " | "), character(1)),
+    masked_text = vapply(res, function(x) {
+      if (is.null(x$masked_text) || is.na(x$masked_text)) "" else x$masked_text
+    }, character(1))
+  )
+}
+
+# =========================================================
+# 3. 每个样本：是否命中、命中多少（非重叠版）
+# =========================================================
+det_4scales <- batch_detect_nonoverlap(ml_data$history_text, phrases_4scales)
+
+ml_hit_4scales <- ml_data %>%
+  mutate(
+    hit_any_4scales = det_4scales$hit_any,
+    n_hit_4scales = det_4scales$n_hit,
+    hit_phrases_4scales = det_4scales$hit_phrases
+  )
+
+write.xlsx(
+  ml_hit_4scales,
+  here("OUTPUT", "Sample_level_phrase_hits_4scales_pure.xlsx"),
+  overwrite = TRUE
+)
+
+cat("已导出样本级命中表：Sample_level_phrase_hits_4scales_pure.xlsx\n")
+
+# =========================================================
+# 4. 整体命中率比较（组水平）
+# =========================================================
+overall_summary_4scales <- ml_hit_4scales %>%
+  group_by(label) %>%
+  summarise(
+    n = n(),
+    prop_hit_any_4scales = mean(hit_any_4scales),
+    mean_n_hit_4scales = mean(n_hit_4scales),
+    median_n_hit_4scales = median(n_hit_4scales),
+    .groups = "drop"
+  ) %>%
+  mutate(group = ifelse(label == 1, "Depression", "Non-depression")) %>%
+  select(group, everything(), -label)
+
+print(overall_summary_4scales)
+
+write.xlsx(
+  overall_summary_4scales,
+  here("OUTPUT", "Group_level_phrase_hit_summary_4scales_pure.xlsx"),
+  overwrite = TRUE
+)
+
+cat("已导出组水平汇总表：Group_level_phrase_hit_summary_4scales_pure.xlsx\n")
+
+# =========================================================
+# 5. 单表述组间比较（非重叠归属版）
+# =========================================================
+phrase_summary_nonoverlap <- function(data, patterns) {
+  det_list <- lapply(data$history_text, detect_patterns_nonoverlap, patterns = patterns)
+
+  hit_rows <- lapply(seq_along(det_list), function(i) {
+    hp <- det_list[[i]]$hit_phrases
+    if (length(hp) == 0) return(NULL)
+
+    data.frame(
+      ID = data$ID[i],
+      label = data$label[i],
+      phrase = hp,
+      stringsAsFactors = FALSE
+    )
+  })
+
+  hit_df <- bind_rows(hit_rows)
+
+  n_dep <- sum(data$label == 1)
+  n_non <- sum(data$label == 0)
+
+  if (nrow(hit_df) == 0) {
+    out <- data.frame(
+      phrase = patterns,
+      dep_hits = 0,
+      non_hits = 0,
+      dep_prop = 0,
+      non_prop = 0,
+      diff_prop = 0,
+      ratio_prop = NA_real_,
+      stringsAsFactors = FALSE
+    )
+  } else {
+    out <- hit_df %>%
+      group_by(phrase, label) %>%
+      summarise(n = n_distinct(ID), .groups = "drop") %>%
+      pivot_wider(
+        names_from = label,
+        values_from = n,
+        values_fill = 0
+      )
+
+    if (!"0" %in% names(out)) out[["0"]] <- 0
+    if (!"1" %in% names(out)) out[["1"]] <- 0
+
+    out <- out %>%
+      transmute(
+        phrase = phrase,
+        dep_hits = `1`,
+        non_hits = `0`,
+        dep_prop = dep_hits / n_dep,
+        non_prop = non_hits / n_non,
+        diff_prop = dep_prop - non_prop,
+        ratio_prop = ifelse(non_prop == 0, NA, dep_prop / non_prop)
+      ) %>%
+      right_join(
+        data.frame(phrase = patterns, stringsAsFactors = FALSE),
+        by = "phrase"
+      ) %>%
+      mutate(
+        dep_hits = coalesce(dep_hits, 0),
+        non_hits = coalesce(non_hits, 0),
+        dep_prop = coalesce(dep_prop, 0),
+        non_prop = coalesce(non_prop, 0),
+        diff_prop = coalesce(diff_prop, 0),
+        ratio_prop = ifelse(non_prop == 0, NA, dep_prop / non_prop)
+      ) %>%
+      arrange(desc(diff_prop), desc(dep_hits))
+  }
+
+  out
+}
+
+phrase_summary_4scales <- phrase_summary_nonoverlap(ml_hit_4scales, phrases_4scales)
+
+write.xlsx(
+  phrase_summary_4scales,
+  here("OUTPUT", "Phrase_level_group_comparison_4scales_pure.xlsx"),
+  overwrite = TRUE
+)
+
+cat("已导出单表述组间比较表：Phrase_level_group_comparison_4scales_pure.xlsx\n")
+
+print(head(phrase_summary_4scales, 20))
+
+# =========================================================
+# 6. Fisher 精确检验 + BH校正
+# =========================================================
+n_dep <- sum(ml_hit_4scales$label == 1)
+n_non <- sum(ml_hit_4scales$label == 0)
+
+add_fisher_stats <- function(df, n_dep, n_non) {
+  df %>%
+    rowwise() %>%
+    mutate(
+      fisher_res = list(
+        fisher.test(
+          matrix(
+            c(
+              dep_hits,
+              n_dep - dep_hits,
+              non_hits,
+              n_non - non_hits
+            ),
+            nrow = 2,
+            byrow = TRUE
+          )
+        )
+      ),
+      p_value = fisher_res$p.value,
+      odds_ratio = unname(fisher_res$estimate),
+      conf_low = fisher_res$conf.int[1],
+      conf_high = fisher_res$conf.int[2]
+    ) %>%
+    ungroup() %>%
+    mutate(
+      p_adj_bh = p.adjust(p_value, method = "BH")
+    ) %>%
+    select(
+      phrase,
+      dep_hits, non_hits,
+      dep_prop, non_prop, diff_prop, ratio_prop,
+      odds_ratio, conf_low, conf_high,
+      p_value, p_adj_bh
+    ) %>%
+    arrange(p_adj_bh, desc(diff_prop), desc(dep_hits))
+}
+
+phrase_summary_4scales_fisher <- add_fisher_stats(
+  phrase_summary_4scales,
+  n_dep,
+  n_non
+)
+
+write.xlsx(
+  phrase_summary_4scales_fisher,
+  here("OUTPUT", "Phrase_level_group_comparison_4scales_pure_with_fisher.xlsx"),
+  overwrite = TRUE
+)
+
+cat("已导出 Fisher 检验结果：Phrase_level_group_comparison_4scales_pure_with_fisher.xlsx\n")
+
+cat("\n校正后显著（BH < 0.05）的表述：\n")
+print(
+  phrase_summary_4scales_fisher %>%
+    filter(p_adj_bh < 0.05),
+  n = 50
+)
+```
