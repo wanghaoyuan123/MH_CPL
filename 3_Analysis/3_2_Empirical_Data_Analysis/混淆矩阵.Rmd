@@ -1,0 +1,842 @@
+```{r}
+# 本脚本用于比较临床诊断与量表结果的混淆矩阵以及ROC曲线
+# 数据来源：
+# Questionnaire_With_Diagnosis_Label.xlsx
+# （已完成：ID 去重 + 病历诊断标签匹配）
+#
+# 分析流程与检出率分析保持一致：
+# - 数值转换
+# - 原始数据 -1
+# - 反向计分
+# - 年龄限制（7–18 岁）
+
+# ============================================================
+# 0) Packages
+# ============================================================
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(pROC)
+library(papaja)
+library(patchwork)
+library(openxlsx)
+library(here)
+# ============================================================
+# 1) 数据读取与预处理（与前面保持一致）
+# ============================================================
+
+clinroc_raw_data <- read.xlsx(
+  here("DATA", "Questionnaire_With_Diagnosis_Label.xlsx")
+)
+
+clinroc_raw_data <- clinroc_raw_data %>%
+  mutate(
+    Gender = factor(Gender, levels = c("男", "女"), labels = c(1, 2))
+  ) %>%
+  mutate(
+    across(matches("Gender|Age|DSRSC|PHQ|DASS|CDI"), as.numeric)
+  ) %>%
+  filter(Age >= 7 & Age <= 18)
+
+# 年龄描述统计
+clinroc_age_summary <- clinroc_raw_data %>%
+  summarise(
+    Age_mean = round(mean(Age, na.rm = TRUE), 2),
+    Age_sd   = round(sd(Age, na.rm = TRUE), 2),
+    Age_min  = round(min(Age, na.rm = TRUE), 2),
+    Age_max  = round(max(Age, na.rm = TRUE), 2)
+  )
+
+cat("\n年龄描述统计：\n")
+print(clinroc_age_summary)
+
+# 原始数据 -1
+clinroc_raw_data <- clinroc_raw_data %>%
+  mutate(
+    across(matches("DSRSC|PHQ|DASS|CDI"), ~ .x - 1)
+  )
+
+# 反向计分
+clinroc_cdi_reverse_items <- c(
+  "CDI2", "CDI5", "CDI7", "CDI8", "CDI10",
+  "CDI11", "CDI13", "CDI15", "CDI16",
+  "CDI18", "CDI21", "CDI24", "CDI25"
+)
+
+clinroc_dsrsc_reverse_items <- c(
+  "DSRSC3", "DSRSC5", "DSRSC6", "DSRSC10",
+  "DSRSC14", "DSRSC15", "DSRSC17", "DSRSC18"
+)
+
+clinroc_ready_data <- clinroc_raw_data %>%
+  mutate(across(all_of(clinroc_cdi_reverse_items), ~ 2 - .)) %>%
+  mutate(across(all_of(clinroc_dsrsc_reverse_items), ~ 2 - .))
+
+# 量表总分（与前面保持一致；CDI26 不计入总分）
+clinroc_ready_data <- clinroc_ready_data %>%
+  mutate(
+    total_DSRSC = rowSums(select(., starts_with("DSRSC")), na.rm = TRUE),
+    total_PHQ   = rowSums(select(., starts_with("PHQ")),   na.rm = TRUE),
+    total_CDI   = rowSums(select(., starts_with("CDI")),   na.rm = TRUE) - CDI26,
+    total_DASS  = rowSums(select(., starts_with("DASS")),  na.rm = TRUE)
+  )
+
+cat("用于 ROC / cutoff 验证分析的样本量：", nrow(clinroc_ready_data), "\n")
+print(table(clinroc_ready_data$Depression_status))
+# ============================================================
+# 2) 构建真实标签与固定 cutoff 预测
+# ============================================================
+
+clinroc_eval_data <- clinroc_ready_data %>%
+  mutate(
+    y_true = ifelse(Depression_status == "Depression", 1, 0),
+
+    pred_DSRSC = ifelse(total_DSRSC >= 15, 1, 0),
+    pred_PHQ   = ifelse(total_PHQ   >= 10, 1, 0),
+    pred_CDI   = ifelse(total_CDI   >= 20, 1, 0),
+
+    # DASS: 男 >= 4, 女 >= 5
+    pred_DASS = case_when(
+      Gender == 1 & total_DASS >= 4 ~ 1,
+      Gender == 2 & total_DASS >= 5 ~ 1,
+      TRUE ~ 0
+    )
+  )
+
+table(clinroc_eval_data$y_true)
+# ============================================================
+# 3) 固定 cutoff 下的指标表
+# ============================================================
+
+clinroc_calc_metrics <- function(y_true, y_pred) {
+
+  tp <- sum(y_true == 1 & y_pred == 1, na.rm = TRUE)
+  fp <- sum(y_true == 0 & y_pred == 1, na.rm = TRUE)
+  fn <- sum(y_true == 1 & y_pred == 0, na.rm = TRUE)
+  tn <- sum(y_true == 0 & y_pred == 0, na.rm = TRUE)
+
+  precision <- ifelse((tp + fp) > 0, tp / (tp + fp), NA)
+  recall    <- ifelse((tp + fn) > 0, tp / (tp + fn), NA)
+  f1        <- ifelse(
+    !is.na(precision) && !is.na(recall) && (precision + recall) > 0,
+    2 * precision * recall / (precision + recall),
+    NA
+  )
+  accuracy    <- (tp + tn) / (tp + fp + fn + tn)
+  sensitivity <- recall
+  specificity <- ifelse((tn + fp) > 0, tn / (tn + fp), NA)
+  ppv         <- precision
+  npv         <- ifelse((tn + fn) > 0, tn / (tn + fn), NA)
+
+  data.frame(
+    TP = tp,
+    FP = fp,
+    FN = fn,
+    TN = tn,
+    Accuracy = accuracy,
+    Sensitivity = sensitivity,
+    Specificity = specificity,
+    PPV = ppv,
+    NPV = npv,
+    F1 = f1
+  )
+}
+
+clinroc_metrics_DSRSC <- clinroc_calc_metrics(clinroc_eval_data$y_true, clinroc_eval_data$pred_DSRSC)
+clinroc_metrics_PHQ   <- clinroc_calc_metrics(clinroc_eval_data$y_true, clinroc_eval_data$pred_PHQ)
+clinroc_metrics_CDI   <- clinroc_calc_metrics(clinroc_eval_data$y_true, clinroc_eval_data$pred_CDI)
+clinroc_metrics_DASS  <- clinroc_calc_metrics(clinroc_eval_data$y_true, clinroc_eval_data$pred_DASS)
+
+clinroc_metrics_DSRSC$Measure <- "DSRSC"
+clinroc_metrics_PHQ$Measure   <- "PHQ-9"
+clinroc_metrics_CDI$Measure   <- "CDI"
+clinroc_metrics_DASS$Measure  <- "DASS"
+
+clinroc_cutoff_metrics <- bind_rows(
+  clinroc_metrics_DSRSC,
+  clinroc_metrics_PHQ,
+  clinroc_metrics_CDI,
+  clinroc_metrics_DASS
+) %>%
+  select(Measure, TP, FP, FN, TN, Accuracy, Sensitivity, Specificity, PPV, NPV, F1)
+
+print(clinroc_cutoff_metrics)
+# ============================================================
+# 4) ROC / AUC（基于连续总分）
+# ============================================================
+
+clinroc_obj_DSRSC <- roc(
+  response = clinroc_eval_data$y_true,
+  predictor = clinroc_eval_data$total_DSRSC,
+  levels = c(0, 1),
+  direction = "<",
+  quiet = TRUE
+)
+
+clinroc_obj_PHQ <- roc(
+  response = clinroc_eval_data$y_true,
+  predictor = clinroc_eval_data$total_PHQ,
+  levels = c(0, 1),
+  direction = "<",
+  quiet = TRUE
+)
+
+clinroc_obj_CDI <- roc(
+  response = clinroc_eval_data$y_true,
+  predictor = clinroc_eval_data$total_CDI,
+  levels = c(0, 1),
+  direction = "<",
+  quiet = TRUE
+)
+
+clinroc_obj_DASS <- roc(
+  response = clinroc_eval_data$y_true,
+  predictor = clinroc_eval_data$total_DASS,
+  levels = c(0, 1),
+  direction = "<",
+  quiet = TRUE
+)
+
+clinroc_auc_table <- data.frame(
+  Measure = c("DSRSC", "PHQ-9", "CDI", "DASS"),
+  AUC = c(
+    as.numeric(auc(clinroc_obj_DSRSC)),
+    as.numeric(auc(clinroc_obj_PHQ)),
+    as.numeric(auc(clinroc_obj_CDI)),
+    as.numeric(auc(clinroc_obj_DASS))
+  )
+)
+
+print(clinroc_auc_table)
+# ============================================================
+# 5) 合并表格结果
+# ============================================================
+
+clinroc_summary_table <- clinroc_cutoff_metrics %>%
+  left_join(clinroc_auc_table, by = "Measure") %>%
+  mutate(
+    across(c(Accuracy, Sensitivity, Specificity, PPV, NPV, F1, AUC), ~ round(.x, 3))
+  )
+
+print(clinroc_summary_table)
+
+openxlsx::write.xlsx(
+  clinroc_summary_table,
+  here("OUTPUT", "Clinical_Diagnosis_F1_AUC_Summary.xlsx"),
+  overwrite = TRUE
+)
+
+cat("✔ 已导出：OUTPUT/Clinical_Diagnosis_F1_AUC_Summary.xlsx\n")
+
+# ============================================================
+# 5.1) 新增：导出适合 Word 三线表的“百分比呈现”表
+#       —— 对应你现在论文里的 Table 1 样式
+# ============================================================
+
+clinroc_total_n <- nrow(clinroc_eval_data)
+
+clinroc_percent_table <- clinroc_cutoff_metrics %>%
+  mutate(
+    `Clinical Depression (Positive)`     = round(TP / clinroc_total_n * 100, 1),
+    `Clinical Depression (Negative)`     = round(FN / clinroc_total_n * 100, 1),
+    `Clinical Non-depression (Positive)` = round(FP / clinroc_total_n * 100, 1),
+    `Clinical Non-depression (Negative)` = round(TN / clinroc_total_n * 100, 1),
+    `F1 score` = round(F1, 3)
+  ) %>%
+  select(
+    Measure,
+    `Clinical Depression (Positive)`,
+    `Clinical Depression (Negative)`,
+    `Clinical Non-depression (Positive)`,
+    `Clinical Non-depression (Negative)`,
+    `F1 score`
+  )
+
+print(clinroc_percent_table)
+
+openxlsx::write.xlsx(
+  clinroc_percent_table,
+  here("OUTPUT", "Clinical_Diagnosis_Percent_Table.xlsx"),
+  overwrite = TRUE
+)
+
+cat("✔ 已导出：OUTPUT/Clinical_Diagnosis_Percent_Table.xlsx\n")
+
+# ============================================================
+# 6) ROC 数据整理
+# ============================================================
+
+clinroc_make_curve_df <- function(roc_obj, measure_name) {
+  data.frame(
+    FPR = 1 - roc_obj$specificities,
+    TPR = roc_obj$sensitivities,
+    Measure = measure_name
+  )
+}
+
+clinroc_curve_df <- bind_rows(
+  clinroc_make_curve_df(clinroc_obj_DSRSC, "DSRSC"),
+  clinroc_make_curve_df(clinroc_obj_PHQ,   "PHQ-9"),
+  clinroc_make_curve_df(clinroc_obj_CDI,   "CDI"),
+  clinroc_make_curve_df(clinroc_obj_DASS,  "DASS")
+)
+
+clinroc_auc_labels <- clinroc_auc_table %>%
+  mutate(
+    curve_label = paste0(Measure, " (AUC = ", sprintf("%.3f", AUC), ")")
+  )
+
+clinroc_curve_df <- clinroc_curve_df %>%
+  left_join(clinroc_auc_labels, by = "Measure")
+# ============================================================
+# 7) 固定 cutoff / 固定规则 对应的 ROC 点
+# ============================================================
+
+clinroc_fixed_points <- clinroc_cutoff_metrics %>%
+  mutate(
+    FPR = 1 - Specificity,
+    TPR = Sensitivity,
+    fixed_rule_label = c(
+      "DSRSC cutoff = 15",
+      "PHQ-9 cutoff = 10",
+      "CDI cutoff = 20",
+      "DASS: M>=4, F>=5"
+    )
+  )
+
+print(clinroc_fixed_points)
+# ============================================================
+# 8) 四宫格 ROC（每张图加固定 cutoff 点）
+# ============================================================
+
+clinroc_plot_one <- function(curve_data, point_data, measure_name) {
+
+  this_curve <- curve_data %>% filter(Measure == measure_name)
+  this_point <- point_data %>% filter(Measure == measure_name)
+  this_auc   <- clinroc_auc_labels %>% filter(Measure == measure_name) %>% pull(curve_label)
+
+  ggplot(this_curve, aes(x = FPR, y = TPR)) +
+    geom_line(linewidth = 1.1, color = "#2b8cbe") +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
+    geom_point(
+      data = this_point,
+      aes(x = FPR, y = TPR),
+      inherit.aes = FALSE,
+      shape = 21,
+      size = 3.2,
+      stroke = 1,
+      fill = "white",
+      color = "black"
+    ) +
+    geom_text(
+      data = this_point,
+      aes(x = FPR, y = TPR, label = fixed_rule_label),
+      inherit.aes = FALSE,
+      size = 3.2,
+      nudge_y = 0.04,
+      color = "black"
+    ) +
+    coord_equal() +
+    labs(
+      title = this_auc,
+      x = "1 - Specificity",
+      y = "Sensitivity"
+    ) +
+    papaja::theme_apa(base_size = 15) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5, size = 13),
+      plot.margin = margin(8, 8, 8, 8)
+    )
+}
+
+clinroc_panel_DSRSC <- clinroc_plot_one(clinroc_curve_df, clinroc_fixed_points, "DSRSC")
+clinroc_panel_PHQ   <- clinroc_plot_one(clinroc_curve_df, clinroc_fixed_points, "PHQ-9")
+clinroc_panel_CDI   <- clinroc_plot_one(clinroc_curve_df, clinroc_fixed_points, "CDI")
+clinroc_panel_DASS  <- clinroc_plot_one(clinroc_curve_df, clinroc_fixed_points, "DASS")
+
+clinroc_four_panel_plot <- (clinroc_panel_DSRSC | clinroc_panel_PHQ) /
+  (clinroc_panel_CDI | clinroc_panel_DASS) +
+  plot_annotation(
+    title = "ROC Curves for Four Depression Questionnaires",
+    theme = theme(
+      plot.title = element_text(face = "bold", hjust = 0.5, size = 16)
+    )
+  )
+
+clinroc_four_panel_plot
+
+ggsave(
+  filename = here("FIGURE", "Clinical_Diagnosis_ROC_FourPanels_WithFixedPoints.png"),
+  plot = clinroc_four_panel_plot,
+  width = 10,
+  height = 9,
+  dpi = 400,
+  bg = "white"
+)
+
+cat("✔ 已生成：FIGURE/Clinical_Diagnosis_ROC_FourPanels_WithFixedPoints.png\n")
+# ============================================================
+# ============================================================
+# 9) 一张图画四条 ROC 曲线 + 固定 cutoff 点（美化版）
+#    —— 图上只保留点，不直接堆文字
+# ============================================================
+
+clinroc_all_in_one_plot <- ggplot(
+  clinroc_curve_df,
+  aes(x = FPR, y = TPR, color = curve_label)
+) +
+  geom_line(linewidth = 1.2) +
+  geom_abline(
+    slope = 1, intercept = 0,
+    linetype = "dashed", color = "grey50"
+  ) +
+  geom_point(
+    data = clinroc_fixed_points,
+    aes(x = FPR, y = TPR),
+    inherit.aes = FALSE,
+    shape = 21,
+    size = 3.8,
+    stroke = 1.1,
+    fill = "white",
+    color = "black"
+  ) +
+  coord_equal() +
+  scale_x_continuous(limits = c(0, 1), expand = c(0, 0)) +
+  scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) +
+  labs(
+    title = "ROC Curves for Four Depression Questionnaires",
+    subtitle = "Open circles indicate the predefined cutoff points.",
+    x = "1 - Specificity",
+    y = "Sensitivity",
+    color = NULL
+  ) +
+  papaja::theme_apa(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, size = 10),
+    legend.position = c(0.68, 0.22),
+    legend.background = element_rect(fill = "white", color = "black", linewidth = 0.3),
+    legend.text = element_text(size = 10)
+  )
+
+clinroc_all_in_one_plot
+
+ggsave(
+  filename = here("FIGURE", "Clinical_Diagnosis_ROC_OnePanel_WithFixedPoints.png"),
+  plot = clinroc_all_in_one_plot,
+  width = 7,
+  height = 6,
+  dpi = 400,
+  bg = "white"
+)
+
+cat("✔ 已生成：FIGURE/Clinical_Diagnosis_ROC_OnePanel_WithFixedPoints.png\n")
+```
+
+```{r}
+# ============================================================
+# 5.1) 按老师要求重新输出：
+#      - 百分比列分别按 Clinical depression / Clinical non-depression / Total 计算
+#      - 同时报告 Sensitivity, % (95% CI) 和 Specificity, % (95% CI)
+#      - 另导出一个 counts 核对表
+# ============================================================
+
+library(dplyr)
+library(openxlsx)
+library(here)
+
+# ------------------------------------------------------------
+# A. 小工具：计算比例的精确95%CI（binom.test）
+# ------------------------------------------------------------
+clinroc_prop_ci <- function(x, n, conf.level = 0.95) {
+  if (is.na(n) || n == 0) {
+    return(c(est = NA, low = NA, high = NA))
+  }
+
+  bt <- binom.test(x, n, conf.level = conf.level)
+
+  c(
+    est  = unname(bt$estimate),
+    low  = bt$conf.int[1],
+    high = bt$conf.int[2]
+  )
+}
+
+clinroc_format_pct_ci <- function(x, n, digits = 1) {
+  ci <- clinroc_prop_ci(x, n)
+  sprintf(
+    paste0("%.", digits, "f (%.", digits, "f, %.", digits, "f)"),
+    ci["est"] * 100,
+    ci["low"] * 100,
+    ci["high"] * 100
+  )
+}
+
+# ------------------------------------------------------------
+# B. 总体样本量（这三个分母是老师这次最关心的）
+# ------------------------------------------------------------
+clinroc_dep_n    <- sum(clinroc_eval_data$y_true == 1, na.rm = TRUE)
+clinroc_nondep_n <- sum(clinroc_eval_data$y_true == 0, na.rm = TRUE)
+clinroc_total_n  <- nrow(clinroc_eval_data)
+
+cat("\n真实抑郁人数 =", clinroc_dep_n,
+    "\n真实非抑郁人数 =", clinroc_nondep_n,
+    "\n总样本量 =", clinroc_total_n, "\n")
+
+# ------------------------------------------------------------
+# C. 定义一个函数：针对每个量表生成
+#    1) 老师要的百分比表（两行：Positive / Negative）
+#    2) 你自己核对的 counts 表（TP/FP/FN/TN）
+# ------------------------------------------------------------
+clinroc_build_teacher_output <- function(y_true, y_pred, measure_name,
+                                         dep_n, nondep_n, total_n) {
+
+  # 如有缺失，先剔除
+  keep <- complete.cases(y_true, y_pred)
+  y_true <- y_true[keep]
+  y_pred <- y_pred[keep]
+
+  tp <- sum(y_true == 1 & y_pred == 1)
+  fp <- sum(y_true == 0 & y_pred == 1)
+  fn <- sum(y_true == 1 & y_pred == 0)
+  tn <- sum(y_true == 0 & y_pred == 0)
+
+  # 百分比（老师要求的分母）
+  dep_pos_pct    <- round(tp / dep_n * 100, 1)
+  dep_neg_pct    <- round(fn / dep_n * 100, 1)
+  nondep_pos_pct <- round(fp / nondep_n * 100, 1)
+  nondep_neg_pct <- round(tn / nondep_n * 100, 1)
+
+  total_pos_pct  <- round((tp + fp) / total_n * 100, 1)
+  total_neg_pct  <- round((fn + tn) / total_n * 100, 1)
+
+  # Sensitivity / Specificity + 95%CI
+  sens_str <- clinroc_format_pct_ci(tp, tp + fn, digits = 1)
+  spec_str <- clinroc_format_pct_ci(tn, tn + fp, digits = 1)
+
+  # 1) 老师要的表：两行
+  percent_table <- data.frame(
+    Measure = c(measure_name, ""),
+    `Scale results` = c("Positive", "Negative"),
+    `Clinical depression, %` = c(dep_pos_pct, dep_neg_pct),
+    `Clinical non-depression, %` = c(nondep_pos_pct, nondep_neg_pct),
+    `Total, %` = c(total_pos_pct, total_neg_pct),
+    `Sensitivity, % (95% CI)` = c(sens_str, ""),
+    `Specificity, % (95% CI)` = c(spec_str, ""),
+    check.names = FALSE
+  )
+
+  # 2) 你自己核对用的人数表
+  counts_table <- data.frame(
+    Measure = measure_name,
+    TP = tp,
+    FP = fp,
+    FN = fn,
+    TN = tn,
+    Depression_n = tp + fn,
+    Non_depression_n = fp + tn,
+    Positive_total = tp + fp,
+    Negative_total = fn + tn,
+    Total_N = tp + fp + fn + tn,
+    Sensitivity = round(tp / (tp + fn), 4),
+    Specificity = round(tn / (tn + fp), 4),
+    check.names = FALSE
+  )
+
+  list(
+    percent_table = percent_table,
+    counts_table = counts_table
+  )
+}
+
+# ------------------------------------------------------------
+# D. 逐个量表生成
+# ------------------------------------------------------------
+clinroc_out_DSRSC <- clinroc_build_teacher_output(
+  y_true = clinroc_eval_data$y_true,
+  y_pred = clinroc_eval_data$pred_DSRSC,
+  measure_name = "DSRSC",
+  dep_n = clinroc_dep_n,
+  nondep_n = clinroc_nondep_n,
+  total_n = clinroc_total_n
+)
+
+clinroc_out_PHQ <- clinroc_build_teacher_output(
+  y_true = clinroc_eval_data$y_true,
+  y_pred = clinroc_eval_data$pred_PHQ,
+  measure_name = "PHQ-9",
+  dep_n = clinroc_dep_n,
+  nondep_n = clinroc_nondep_n,
+  total_n = clinroc_total_n
+)
+
+clinroc_out_CDI <- clinroc_build_teacher_output(
+  y_true = clinroc_eval_data$y_true,
+  y_pred = clinroc_eval_data$pred_CDI,
+  measure_name = "CDI",
+  dep_n = clinroc_dep_n,
+  nondep_n = clinroc_nondep_n,
+  total_n = clinroc_total_n
+)
+
+clinroc_out_DASS <- clinroc_build_teacher_output(
+  y_true = clinroc_eval_data$y_true,
+  y_pred = clinroc_eval_data$pred_DASS,
+  measure_name = "DASS",
+  dep_n = clinroc_dep_n,
+  nondep_n = clinroc_nondep_n,
+  total_n = clinroc_total_n
+)
+
+# ------------------------------------------------------------
+# E. 合并成最终输出表
+# ------------------------------------------------------------
+clinroc_teacher_percent_table <- bind_rows(
+  clinroc_out_DSRSC$percent_table,
+  clinroc_out_PHQ$percent_table,
+  clinroc_out_CDI$percent_table,
+  clinroc_out_DASS$percent_table
+)
+
+clinroc_teacher_counts_table <- bind_rows(
+  clinroc_out_DSRSC$counts_table,
+  clinroc_out_PHQ$counts_table,
+  clinroc_out_CDI$counts_table,
+  clinroc_out_DASS$counts_table
+)
+
+# 把列名改成老师想看的样子（把 n/N 放到列名里）
+names(clinroc_teacher_percent_table)[3] <- paste0(
+  "Clinical depression (n = ", clinroc_dep_n, "), %"
+)
+names(clinroc_teacher_percent_table)[4] <- paste0(
+  "Clinical non-depression (n = ", clinroc_nondep_n, "), %"
+)
+names(clinroc_teacher_percent_table)[5] <- paste0(
+  "Total (N = ", clinroc_total_n, "), %"
+)
+
+cat("\n===== 老师要求的百分比表 =====\n")
+print(clinroc_teacher_percent_table)
+
+cat("\n===== 核对用 counts 表 =====\n")
+print(clinroc_teacher_counts_table)
+
+# ------------------------------------------------------------
+# F. 导出 Excel（一个文件两个 sheet）
+# ------------------------------------------------------------
+wb <- createWorkbook()
+
+addWorksheet(wb, "Teacher_percent_table")
+writeData(wb, "Teacher_percent_table", clinroc_teacher_percent_table)
+
+addWorksheet(wb, "Counts_check")
+writeData(wb, "Counts_check", clinroc_teacher_counts_table)
+
+saveWorkbook(
+  wb,
+  here("OUTPUT", "Clinical_Diagnosis_Teacher_Table.xlsx"),
+  overwrite = TRUE
+)
+
+cat("✔ 已导出：OUTPUT/Clinical_Diagnosis_Teacher_Table.xlsx\n")
+
+```
+
+
+```{r}
+# ============================================================
+# Faceted ROC：共享坐标轴 + cutoff / optimal（改良版）
+# ============================================================
+
+library(dplyr)
+library(ggplot2)
+library(pROC)
+library(papaja)
+library(here)
+library(grid)
+
+# ------------------------------------------------------------
+# 1) ROC 曲线数据
+# ------------------------------------------------------------
+clinroc_grid_curve_df <- bind_rows(
+  clinroc_make_curve_df(clinroc_obj_DSRSC, "DSRSC"),
+  clinroc_make_curve_df(clinroc_obj_PHQ,   "PHQ-9"),
+  clinroc_make_curve_df(clinroc_obj_CDI,   "CDI"),
+  clinroc_make_curve_df(clinroc_obj_DASS,  "DASS")
+)
+
+# 固定量表顺序
+clinroc_measure_levels <- c("DSRSC", "PHQ-9", "CDI", "DASS")
+
+clinroc_grid_curve_df <- clinroc_grid_curve_df %>%
+  mutate(
+    Measure = factor(Measure, levels = clinroc_measure_levels)
+  )
+
+clinroc_grid_auc_df <- clinroc_auc_table %>%
+  mutate(
+    Measure = factor(Measure, levels = clinroc_measure_levels),
+    facet_title = paste0(as.character(Measure), " (AUC = ", sprintf("%.3f", AUC), ")")
+  )
+
+# 关键：把 facet_title 也设成固定顺序的 factor
+clinroc_grid_auc_df <- clinroc_grid_auc_df %>%
+  mutate(
+    facet_title = factor(
+      facet_title,
+      levels = facet_title[match(clinroc_measure_levels, Measure)]
+    )
+  )
+
+clinroc_grid_curve_df <- clinroc_grid_curve_df %>%
+  left_join(clinroc_grid_auc_df, by = "Measure")
+
+# ------------------------------------------------------------
+# 2) cutoff 点
+# ------------------------------------------------------------
+clinroc_grid_cutoff_df <- clinroc_cutoff_metrics %>%
+  mutate(
+    Measure = factor(Measure, levels = clinroc_measure_levels),
+    FPR = 1 - Specificity,
+    TPR = Sensitivity,
+    point_type = "cutoff"
+  ) %>%
+  left_join(clinroc_grid_auc_df, by = "Measure")
+
+# ------------------------------------------------------------
+# 3) optimal 点（Youden）
+# ------------------------------------------------------------
+clinroc_grid_get_optimal <- function(roc_obj, measure_name) {
+  best_coords <- pROC::coords(
+    roc_obj,
+    x = "best",
+    best.method = "youden",
+    ret = c("specificity", "sensitivity"),
+    transpose = FALSE
+  )
+
+  data.frame(
+    Measure = measure_name,
+    FPR = 1 - as.numeric(best_coords["specificity"]),
+    TPR = as.numeric(best_coords["sensitivity"]),
+    point_type = "optimal"
+  )
+}
+
+clinroc_grid_optimal_df <- bind_rows(
+  clinroc_grid_get_optimal(clinroc_obj_DSRSC, "DSRSC"),
+  clinroc_grid_get_optimal(clinroc_obj_PHQ,   "PHQ-9"),
+  clinroc_grid_get_optimal(clinroc_obj_CDI,   "CDI"),
+  clinroc_grid_get_optimal(clinroc_obj_DASS,  "DASS")
+) %>%
+  mutate(
+    Measure = factor(Measure, levels = clinroc_measure_levels)
+  ) %>%
+  left_join(clinroc_grid_auc_df, by = "Measure")
+
+# ------------------------------------------------------------
+# 4) 合并点 + 为标签设置“更远”的偏移
+# ------------------------------------------------------------
+clinroc_grid_points_df <- bind_rows(
+  clinroc_grid_cutoff_df %>%
+    select(Measure, facet_title, FPR, TPR, point_type),
+  clinroc_grid_optimal_df %>%
+    select(Measure, facet_title, FPR, TPR, point_type)
+) %>%
+  mutate(
+    label_x = ifelse(point_type == "cutoff", FPR + 0.07, FPR - 0.10),
+    label_y = ifelse(point_type == "cutoff", TPR + 0.05, TPR - 0.07)
+  )
+
+# 避免文字跑出边界
+clinroc_grid_points_df <- clinroc_grid_points_df %>%
+  mutate(
+    label_x = pmin(pmax(label_x, 0.03), 0.97),
+    label_y = pmin(pmax(label_y, 0.03), 0.97)
+  )
+
+# ------------------------------------------------------------
+# 5) 一个 ggplot 对象，用 facet_wrap 共享坐标轴
+# ------------------------------------------------------------
+clinroc_grid_plot <- ggplot(
+  clinroc_grid_curve_df,
+  aes(x = FPR, y = TPR)
+) +
+  geom_line(linewidth = 1.15, color = "#2b8cbe") +
+  geom_abline(
+    slope = 1, intercept = 0,
+    linetype = "dashed", color = "grey55"
+  ) +
+  geom_point(
+    data = clinroc_grid_points_df %>% filter(point_type == "cutoff"),
+    aes(x = FPR, y = TPR),
+    inherit.aes = FALSE,
+    shape = 21,
+    size = 3.5,
+    stroke = 1,
+    fill = "white",
+    color = "black"
+  ) +
+  geom_point(
+    data = clinroc_grid_points_df %>% filter(point_type == "optimal"),
+    aes(x = FPR, y = TPR),
+    inherit.aes = FALSE,
+    shape = 24,
+    size = 4.0,
+    stroke = 1,
+    fill = "white",
+    color = "black"
+  ) +
+  # 用 label 而不是 text，给白底，避免压在线上看不清
+  geom_label(
+    data = clinroc_grid_points_df,
+    aes(x = label_x, y = label_y, label = point_type),
+    inherit.aes = FALSE,
+    size = 3.0,
+    label.size = 0,
+    fill = "white",
+    alpha = 0.9
+  ) +
+  facet_wrap(~ facet_title, ncol = 2) +
+  coord_equal() +
+  scale_x_continuous(
+    limits = c(0, 1),
+    expand = c(0, 0),
+    breaks = c(0, 0.25, 0.50, 0.75, 1.00),
+    labels = c("0.00", "0.25", "0.50", "0.75", "1.00")
+  ) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    expand = c(0, 0),
+    breaks = c(0, 0.25, 0.50, 0.75, 1.00),
+    labels = c("0.00", "0.25", "0.50", "0.75", "1.00")
+  ) +
+  labs(
+    title = "ROC Curves for Four Depression scales",
+    x = "False Positive Rate",
+    y = "True Positive Rate"
+  ) +
+  papaja::theme_apa(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 15),
+    strip.text = element_text(face = "bold", size = 11),
+    panel.spacing = grid::unit(1.8, "lines"),
+    axis.title.x = element_text(margin = margin(t = 12)),
+    axis.title.y = element_text(margin = margin(r = 12))
+  )
+
+clinroc_grid_plot
+
+ggsave(
+  filename = here("FIGURE", "Clinical_Diagnosis_ROC_Faceted_Cutoff_Optimal.png"),
+  plot = clinroc_grid_plot,
+  width = 11.5,
+  height = 8.8,
+  dpi = 400,
+  bg = "white"
+)
+
+cat("✔ 已生成：FIGURE/Clinical_Diagnosis_ROC_Faceted_Cutoff_Optimal.png\n")
+
+```
